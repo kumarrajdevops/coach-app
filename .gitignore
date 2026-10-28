@@ -22,3 +22,23 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Secrets / credentials - never commit
+*.pem
+*.key
+*.ppk
+.env
+.env.*
+/learning/
+
+# Personal planning docs and pre-React prototype files - not part of the app,
+# kept locally only (not published to the public repo)
+/CRASH_MODE_PLAN.md
+/DEVOPS_SENIOR_ARCHITECT_FULL_PLAN.md
+/FULL_COURSE_RESUMED_PLAN.md
+/cheat-sheet.html
+/coach-mode.html
+/readiness-scorecard.html
+/notes.html
+/notes-interview-basics.html
+/terraform-extra-reference.html

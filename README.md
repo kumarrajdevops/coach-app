@@ -1,32 +1,30 @@
-# React + TypeScript + Vite
+# Coach App
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+A self-paced DevOps / AWS interview-prep course, built as a React + Vite + TypeScript app. Each topic (EC2, ASG, ALB & NLB, VPC, Terraform, ...) is its own guided module: knowledge → pieces → hands-on → troubleshoot → key-insight → Q&A → fault-injection → Q&A → conclusion, with later stages gated until you've answered the round ahead of them.
 
-Currently, two official plugins are available:
+## Running it
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```bash
+npm install
+npm run dev
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+It prints a local URL (usually `http://localhost:5173` — use whatever port it actually reports). Open that in a browser.
+
+Optionally, run the local save server alongside it so answers persist to disk as well as to the browser's local storage:
+
+```bash
+python save_server.py
+```
+
+It listens on `http://127.0.0.1:8765` and writes to `coach-mode-data.json`. The app works without it — saves just stay in local storage only.
+
+## Content format
+
+Each module is authored as a plain-text `.txt` file in `src/data/content/` using a small tag vocabulary (`[STAGE]`, `[CODE]`, `[DEFS]`, `[TABLE]`, `[ROUND]`, etc.), parsed into the app's typed model by `src/lib/parseModuleContent.ts`. See `src/data/modules.ts` for how modules are loaded.
+
+## Building
+
+```bash
+npm run build
+```
