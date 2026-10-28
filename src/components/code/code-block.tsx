@@ -5,13 +5,17 @@ import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 import type { CodeExample } from "@/types"
 
-// prism-react-renderer doesn't ship an "hcl" grammar; Terraform's HCL is
-// close enough to a generic brace/string language that plain text keeps it
-// readable without pulling in an extra grammar just for a handful of
-// snippets. yaml/bash/json are supported natively. "text"/"tree" are handled
-// separately below with no highlighting at all (plain diagrams/output).
+// prism-react-renderer doesn't ship an "hcl" grammar, and it has no generic
+// "no highlighting" fallback — an unrecognized language used to silently
+// fall through to "tsx". That's actively wrong for HCL: a heredoc like
+// `<<-EOF` starts with `<`, which the tsx tokenizer tries to parse as JSX,
+// and on blocks as large as the hands-on Terraform code that's expensive,
+// pathological regex backtracking done synchronously during mount — the
+// likely cause of a visible stall/flash switching to and from that page.
+// Treating "hcl" as plain text (like "text"/"tree") avoids the wrong
+// grammar entirely; it's still perfectly readable monospace.
 const SUPPORTED: Record<string, Language> = { yaml: "yaml", bash: "bash", json: "json" }
-const PLAIN_LANGUAGES = new Set(["text", "tree"])
+const PLAIN_LANGUAGES = new Set(["text", "tree", "hcl"])
 
 export function CodeBlock({ language, caption, code }: CodeExample) {
   const [copied, setCopied] = useState(false)

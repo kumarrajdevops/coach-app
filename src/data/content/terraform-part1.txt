@@ -1,0 +1,258 @@
+MODULE: terraform-1
+TITLE: Terraform — Part 1: Hardcoded Basics
+COVERED: 2026-10-28
+
+[STAGE knowledge]
+HEADING: Same journey, same order, now in Terraform
+[P]
+Not a new topic — the exact same build you already did by hand with `aws` commands: EC2, then an ASG, then an ALB, then finally a real VPC. This time every resource gets declared once in a `.tf` file instead of typed as a CLI command, and Terraform works out the create order from how resources reference each other. Deliberately no variables, no `count`, no modules yet — just literal values everywhere, so the only thing being learned right now is "how does the thing I already did map onto HCL syntax," one resource type at a time, with a real check after each one before moving to the next.
+
+[STAGE pieces]
+HEADING: Provider, resource, data source, state, plan/apply
+[DIAGRAM nodes="HCL code (.tf files)|terraform plan|terraform apply|AWS API|Real infrastructure" highlight="terraform plan|terraform apply"]
+[DEFS]
+Provider :: the plugin that knows how to talk to a specific API — `provider "aws" { region = "us-east-1" }` declared once, configures which account/region every resource in the config talks to.
+Resource :: a single infrastructure object you want to exist, declared as `resource "<type>" "<local_name>" { ... }` — an EC2 instance, a VPC, a Security Group. The local name is just how other resources in the SAME config refer to it; it's never sent to AWS.
+Data source :: **means:** a read-only lookup of something that already exists, declared as `data "<type>" "<local_name>" { ... }` instead of `resource`. Used below to find your account's existing default VPC and its subnets — Terraform doesn't manage them, it just reads their real IDs so the hardcoded values in this page actually work in your account, not a fake placeholder ID.
+State file :: Terraform's own record of exactly what it last created and with what settings — without it, Terraform has no memory of what it already owns, and every `apply` would try to create everything from scratch again.
+plan / apply :: `terraform plan` computes the diff between your code, the state file, and the real world (a live API call) — a dry run, nothing changes yet. `terraform apply` executes exactly that diff.
+HCL (HashiCorp Configuration Language) :: the declarative syntax `.tf` files are written in. Resources reference each other directly by local name — `aws_instance.web.id`, `aws_lb_target_group.web.arn` — and Terraform automatically works out the correct creation order from those references alone, no manual sequencing.
+
+[STAGE hands-on]
+HEADING: EC2, then ASG, then ALB, then VPC — one check after each
+[P]
+Everything below goes in one working directory. Add each block, run `terraform plan` then `terraform apply`, verify it for real, then move to the next step — don't write all four steps and apply once.
+[CODE lang=hcl caption="main.tf - provider, and look up your account's actual default VPC/subnets"]
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"                      # hardcoded on purpose - no variables yet
+}
+
+data "aws_vpc" "default" {
+  default = true                            # finds your account's real default VPC - no fake ID needed
+}
+
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+}
+[CODE lang=hcl caption="step 1: EC2 - a Security Group and one instance, exactly like the very first EC2 lesson"]
+resource "aws_security_group" "web" {
+  name   = "tf1-web-sg"
+  vpc_id = data.aws_vpc.default.id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]             # HTTP from anywhere
+  }
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["203.0.113.5/32"]        # hardcoded to YOUR real public IP, not a placeholder
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_instance" "web" {
+  ami                    = "ami-0abcd1234efgh5678"   # a real Amazon Linux 2023 AMI id for your region
+  instance_type          = "t3.micro"
+  subnet_id              = data.aws_subnets.default.ids[0]
+  vpc_security_group_ids = [aws_security_group.web.id]
+  associate_public_ip_address = true
+  key_name               = "your-keypair-name"
+  user_data = <<-EOF
+    #!/bin/bash
+    dnf install -y nginx
+    systemctl enable --now nginx
+  EOF
+  tags = { Name = "tf1-ec2" }
+}
+[CODE lang=bash caption="CHECK 1 - plan, apply, curl it"]
+terraform plan
+terraform apply
+curl http://$(terraform output -raw 2>/dev/null || aws ec2 describe-instances --instance-ids $(terraform state show aws_instance.web | grep -m1 '^resource' > /dev/null; terraform state list) --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+# simpler: just read the public IP straight from the console or
+# aws ec2 describe-instances and curl it directly - confirm nginx's default page
+[CODE lang=hcl caption="step 2: replace the single instance with a launch template + ASG"]
+# Remove the aws_instance.web block above entirely - the ASG creates instances now
+resource "aws_launch_template" "web" {
+  name_prefix   = "tf1-web-"
+  image_id      = "ami-0abcd1234efgh5678"             # same AMI id, hardcoded again - notice the duplication
+  instance_type = "t3.micro"
+  key_name      = "your-keypair-name"
+  vpc_security_group_ids = [aws_security_group.web.id]
+  user_data = base64encode(<<-EOF
+    #!/bin/bash
+    dnf install -y nginx
+    systemctl enable --now nginx
+  EOF
+  )
+}
+
+resource "aws_autoscaling_group" "web" {
+  name                = "tf1-web-asg"
+  min_size            = 2
+  desired_capacity    = 2
+  max_size            = 4
+  vpc_zone_identifier = data.aws_subnets.default.ids   # spans whichever default subnets exist
+  health_check_type   = "EC2"                           # Part 1 keeps it simple - ELB type comes with the ALB step
+
+  launch_template {
+    id      = aws_launch_template.web.id
+    version = "$Latest"
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "tf1-asg-instance"
+    propagate_at_launch = true
+  }
+}
+[CODE lang=bash caption="CHECK 2 - plan, apply, confirm 2 instances are InService"]
+terraform plan
+terraform apply
+aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names tf1-web-asg \
+  --query 'AutoScalingGroups[0].Instances[].[InstanceId,LifecycleState,HealthStatus]' --output table
+[CODE lang=hcl caption="step 3: ALB in front of the ASG"]
+resource "aws_lb_target_group" "web" {
+  name     = "tf1-web-tg"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = data.aws_vpc.default.id
+
+  health_check {
+    path                = "/"
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+    interval            = 15
+  }
+}
+
+resource "aws_autoscaling_attachment" "web" {
+  autoscaling_group_name = aws_autoscaling_group.web.name
+  lb_target_group_arn    = aws_lb_target_group.web.arn
+}
+
+resource "aws_lb" "web" {
+  name               = "tf1-web-alb"
+  internal           = false
+  load_balancer_type = "application"
+  subnets            = data.aws_subnets.default.ids
+  security_groups    = [aws_security_group.web.id]
+}
+
+resource "aws_lb_listener" "web" {
+  load_balancer_arn = aws_lb.web.arn
+  port              = 80
+  protocol          = "HTTP"
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.web.arn
+  }
+}
+[CODE lang=bash caption="CHECK 3 - plan, apply, curl the ALB's own DNS name"]
+terraform plan
+terraform apply
+curl http://$(terraform output -raw alb_dns_name)
+# (add an `output "alb_dns_name" { value = aws_lb.web.dns_name }` block if you haven't yet)
+[CODE lang=hcl caption="step 4: a real custom VPC - two public subnets, hardcoded, no count"]
+resource "aws_vpc" "main" {
+  cidr_block = "10.2.0.0/16"
+  tags       = { Name = "tf1-vpc" }
+}
+
+resource "aws_subnet" "public_a" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block               = "10.2.1.0/24"
+  availability_zone        = "us-east-1a"
+  map_public_ip_on_launch  = true
+  tags = { Name = "tf1-public-a" }
+}
+
+resource "aws_subnet" "public_b" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block               = "10.2.2.0/24"
+  availability_zone        = "us-east-1b"
+  map_public_ip_on_launch  = true
+  tags = { Name = "tf1-public-b" }
+}
+
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+}
+
+resource "aws_route_table_association" "public_a" {
+  subnet_id      = aws_subnet.public_a.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "public_b" {
+  subnet_id      = aws_subnet.public_b.id
+  route_table_id = aws_route_table.public.id
+}
+[NOTE]
+Now update aws_autoscaling_group.web's vpc_zone_identifier and aws_lb.web's subnets to [aws_subnet.public_a.id, aws_subnet.public_b.id] instead of the default-VPC data source, and update the Security Group's vpc_id to aws_vpc.main.id. Then plan/apply once more - this is the same "migrate into a real VPC" step from the VPC page, just expressed as a code change instead of an aws CLI command.
+[CODE lang=bash caption="CHECK 4 - final verification"]
+terraform plan
+terraform apply
+curl http://$(terraform output -raw alb_dns_name)
+# Full stack: real VPC, real ASG, real ALB, all declared in code, all reproducible
+# by anyone who runs terraform apply against this same config
+
+[STAGE troubleshoot]
+HEADING: The copy-paste mistake hiding in step 4
+[P]
+`aws_subnet.public_b` was created by copying `aws_subnet.public_a` and editing three lines. Here's the realistic version of that copy-paste: you update the CIDR block and the tag name, but miss the availability_zone line - it's still "us-east-1a", left over from the copy.
+[CODE lang=bash caption="terraform plan would show... nothing wrong at all"]
+terraform plan
+# No errors. No warnings. Completely valid HCL - two subnets, both in us-east-1a.
+# The plan succeeds and apply would succeed too.
+[P]
+Nothing catches this automatically. You'd only notice by actually reading the plan output's availability_zone values carefully, or by checking afterward with:
+[CODE lang=bash caption="the only way to actually catch it"]
+aws ec2 describe-subnets --filters Name=vpc-id,Values=<vpc-id> \
+  --query 'Subnets[*].[SubnetId,AvailabilityZone]' --output table
+# Both rows show the same AZ - the "multi-AZ" ASG/ALB setup you THINK you built
+# is actually single-AZ, silently, with no error anywhere in the apply
+
+[STAGE key-insight]
+HEADING: Hardcoding doesn't just duplicate values - it duplicates mistakes
+[NOTE]
+Terraform validates that your HCL is syntactically correct and that resource arguments are the right type - it does not validate that two "different" blocks are actually different in the way you intended. Copy-pasting a block and editing some but not all of the literal values is a real, common, completely silent failure mode - the exact kind of bug that's invisible until you specifically go looking for it. This is the honest motivation for Part 2: every hardcoded value that appears more than once (the AMI id in the launch template, now also still sitting in a leftover note from step 1; the availability zones repeated across subnet and route-table-association blocks) is a place a future edit can silently diverge. Variables and `count`/`for_each` don't just save typing - they make this specific class of mistake structurally impossible, because there's only one place the value is ever written.
+
+[ROUND terraform1_r1]
+QUESTION: In step 4, if you'd used two separate, fully hardcoded aws_route_table_association blocks (one per subnet) instead of the pattern shown, and later needed a third public subnet, what exactly would you have to add or change across the files from this page - list every resource block affected? Then: name one place in this page's hardcoded code (besides the subnet AZ example) where the same literal value appears in more than one spot, and what the real risk is if only one copy ever gets updated.
+DOUBTS:
+ANSWER:
+SAVEDAT:
+REVIEWED: false
+VERDICT:
+ASSESSMENT:
+CLARIFICATION:

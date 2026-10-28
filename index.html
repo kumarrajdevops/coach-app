@@ -5,6 +5,13 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Coach Mode</title>
+    <!--
+      Paints the page's actual background immediately, before the stylesheet
+      loads — otherwise every full reload briefly shows a blank white page
+      first. Kept in sync with --background in src/index.css by hand since
+      this has to run before any CSS file is fetched/parsed.
+    -->
+    <style>html,body{background:#f4f6fb}</style>
   </head>
   <body>
     <div id="root"></div>

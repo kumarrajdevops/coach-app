@@ -3,9 +3,35 @@ import { postSave, type SaveResult } from "@/lib/api"
 import { exportStateToFile, importStateFromFile, loadState, saveState } from "@/lib/storage"
 import type { CoachState, Module } from "@/types"
 
+// Remembers which module was open so a refresh or a tab that Chrome
+// discarded under memory pressure (both fully remount the app) comes back
+// to where you actually were instead of always falling back to modules[0].
+const ACTIVE_MODULE_KEY = "coach_active_module_v1"
+
+function loadActiveModuleId(modules: Module[]): string {
+  try {
+    const stored = localStorage.getItem(ACTIVE_MODULE_KEY)
+    if (stored && modules.some((m) => m.id === stored)) return stored
+  } catch {
+    // fall through to default
+  }
+  return modules[0]?.id ?? ""
+}
+
 export function useCoachState() {
   const [state, setState] = useState<CoachState>(() => loadState())
-  const [activeModuleId, setActiveModuleId] = useState<string>(() => state.modules[0]?.id ?? "")
+  const [activeModuleId, setActiveModuleIdState] = useState<string>(() =>
+    loadActiveModuleId(state.modules),
+  )
+
+  const setActiveModuleId = useCallback((id: string) => {
+    setActiveModuleIdState(id)
+    try {
+      localStorage.setItem(ACTIVE_MODULE_KEY, id)
+    } catch {
+      // purely a UI convenience — fine if it doesn't persist
+    }
+  }, [])
 
   const activeModule = useMemo<Module | undefined>(
     () => state.modules.find((m) => m.id === activeModuleId),

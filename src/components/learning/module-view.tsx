@@ -1,4 +1,5 @@
 import { CheckCircle2 } from "lucide-react"
+import { useLayoutEffect } from "react"
 import { SectionCard } from "@/components/learning/section-card"
 import { RoundWorkspace } from "@/components/learning/round-workspace"
 import { HistoryRound } from "@/components/knowledge-check/history-round"
@@ -25,6 +26,20 @@ export function ModuleView({ module, onSaveRound }: ModuleViewProps) {
     activeRoundIndex === -1 ? module.timeline : module.timeline.slice(0, activeRoundIndex + 1)
 
   let roundNumber = 0
+
+  // Runs once per module switch (this component remounts via the `key` its
+  // parent gives it) — restores whatever scroll position app-shell.tsx last
+  // saved for this specific module, instead of always starting at the top.
+  useLayoutEffect(() => {
+    const main = document.querySelector("main")
+    if (!main) return
+    try {
+      const saved = sessionStorage.getItem(`coach_scroll_${module.id}`)
+      main.scrollTop = saved ? Number(saved) : 0
+    } catch {
+      main.scrollTop = 0
+    }
+  }, [module.id])
 
   return (
     <div className="mx-auto max-w-3xl space-y-4">
