@@ -1,0 +1,176 @@
+MODULE: alb-nlb
+TITLE: ALB & NLB
+COVERED: 2026-10-25
+
+[STAGE knowledge]
+HEADING: One stable address, and the health check that finally sees the app
+[P]
+Two problems have been quietly waiting since the last two pages. First: your ASG's two instances each have their own public IP, and that IP changes every time an instance gets replaced — nobody wants to hand users two URLs and tell them to try both. Second, the real one: the ASG's default health check only asks "is the VM alive," and you proved firsthand it's blind to an app that's actually dead. Both problems have the same fix. A load balancer gives clients one stable front door, and — this is the part that actually matters — it's the mechanism that lets the ASG finally ask "is the app actually working," not just "did the VM boot."
+
+[STAGE pieces]
+HEADING: ALB vs NLB, target groups, and a health check that checks the app
+[DIAGRAM nodes="Client|ALB|Target Group|ASG|EC2 instance" highlight="ALB|Target Group"]
+[TABLE]
+ | ALB (Application Load Balancer) | NLB (Network Load Balancer)
+OSI layer | Layer 7 (HTTP/HTTPS) — understands requests | Layer 4 (TCP/UDP) — just forwards packets
+Routing | Can route by URL path or hostname to different target groups (/api/* to one service, /* to another) | Can't inspect the request at all — routes purely by connection
+Performance | Slight overhead from inspecting each request | Ultra-low latency, millions of requests/sec — built for raw throughput
+Use it for | Ordinary web apps/APIs — almost always the right default | Extreme throughput, non-HTTP protocols, or when you need a static IP for the load balancer itself
+[DEFS]
+Target group :: the set of instances (or IPs, or Lambda functions) a load balancer actually sends traffic to, plus the health check config that decides which of them are currently eligible. An ASG registers/deregisters its own instances into a target group automatically as it scales — you attach the ASG to the target group once, not instance by instance.
+Listener :: the rule on the load balancer itself that says "traffic arriving on this port, using this protocol, gets forwarded to this target group." A load balancer can have multiple listeners (e.g. 80 and 443) each pointing at different target groups.
+Health check (on the target group) :: an independent, ongoing HTTP request the load balancer makes to each target on its own schedule — a specific path, at a specific interval, needing a specific number of consecutive successes (healthy threshold) or failures (unhealthy threshold) before it flips a target's status. This is a completely separate mechanism from the ASG's own health check setting — it's what the ASG's ELB health check type actually listens to.
+Deregistration delay (connection draining) :: when a target is about to be removed, the load balancer stops sending it *new* requests but waits a configurable delay (default 300s) for in-flight requests to finish before fully deregistering it — so scaling down doesn't abruptly drop real users mid-request.
+
+[STAGE hands-on]
+HEADING: Wiring an ALB in front of the ASG, and finally closing the health-check gap
+[P]
+This builds directly on `web-asg` from the last page — same instances, same launch template, nothing rebuilt from scratch.
+[CODE lang=bash caption="1. create a target group with an HTTP health check on /"]
+aws elbv2 create-target-group \
+  --name web-tg \
+  --protocol HTTP --port 80 \
+  --vpc-id vpc-0123456789abcdef0 \
+  --health-check-protocol HTTP --health-check-path / \     # checks the actual app, not just the VM
+  --healthy-threshold-count 2 --unhealthy-threshold-count 2 \
+  --health-check-interval-seconds 15
+# Note the returned TargetGroupArn - every command below needs it
+[CODE lang=bash caption="2. attach the ASG to the target group — it registers/deregisters instances automatically"]
+aws autoscaling attach-load-balancer-target-groups \
+  --auto-scaling-group-name web-asg \
+  --target-group-arns <target-group-arn>
+[CODE lang=bash caption="3. switch the ASG's health check type to ELB - the fix the last two pages were building to"]
+aws autoscaling update-auto-scaling-group \
+  --auto-scaling-group-name web-asg \
+  --health-check-type ELB --health-check-grace-period 300   # grace period so a booting instance isn't flagged too early
+[CODE lang=bash caption="4. create the ALB itself, in its own Security Group"]
+aws elbv2 create-load-balancer \
+  --name web-alb \
+  --type application \
+  --subnets subnet-aaa subnet-bbb \
+  --security-groups sg-alb0123456789            # a separate SG for the ALB, allowing inbound 80 from 0.0.0.0/0
+# Note the returned LoadBalancerArn and DNSName
+[CODE lang=bash caption="5. create a listener - forward port 80 traffic to the target group"]
+aws elbv2 create-listener \
+  --load-balancer-arn <load-balancer-arn> \
+  --protocol HTTP --port 80 \
+  --default-actions Type=forward,TargetGroupArn=<target-group-arn>
+[CODE lang=bash caption="6. confirm both targets are healthy, then test through the ALB's own DNS name"]
+aws elbv2 describe-target-health --target-group-arn <target-group-arn> \
+  --query 'TargetHealthDescriptions[].[Target.Id,TargetHealth.State]' --output table
+# Expect both instances "healthy"
+
+curl http://<alb-dns-name>        # routed through the ALB this time, not a raw instance IP
+
+[STAGE troubleshoot]
+HEADING: The app is fine. The load balancer disagrees.
+[P]
+A teammate "improves" the target group by pointing the health check at a more specific-sounding path:
+[CODE lang=bash caption="the change that broke it"]
+aws elbv2 modify-target-group --target-group-arn <target-group-arn> --health-check-path /health
+[P]
+Nobody ever added a `/health` route to nginx. Check what the load balancer now thinks:
+[CODE lang=bash caption="check target health, then check the instance directly"]
+aws elbv2 describe-target-health --target-group-arn <target-group-arn> \
+  --query 'TargetHealthDescriptions[].[Target.Id,TargetHealth.State,TargetHealth.Reason]' --output table
+# Expect both targets "unhealthy", reason Target.FailedHealthChecks
+
+curl http://<instance-ip>/         # still returns nginx's default page just fine
+curl http://<instance-ip>/health   # 404 - this is exactly what the ALB has been seeing
+
+[STAGE key-insight]
+HEADING: A health check only knows what you point it at
+[NOTE]
+This is the inverse of the ASG lesson, not a repeat of it. There, the problem was a health check that didn't look hard enough (EC2-level only, blind to the app). Here, the health check genuinely is checking the app over real HTTP — it's just checking the wrong path. A perfectly healthy app returns 404 on a route that was never built, and from the load balancer's point of view that's indistinguishable from the app being down. Same root lesson as the whole series, one layer up: your automation is only ever as good as what you actually told it to check.
+
+[ROUND alb_r1]
+QUESTION: Your target group's health check path was changed to /health, describe-target-health shows both targets "unhealthy," but curling each instance directly on / returns nginx's default page fine. Since you set the ASG's health check type to ELB in the hands-on step, what do you expect to happen to these instances if this isn't fixed quickly - and why would that NOT actually solve the underlying problem?
+DOUBTS: 1.note: we need to have hands-on in network loadbalncer and as well gateway loadbalancer in future.
+2.how to check alb logs
+3.if application is down how to debug from alb
+4. should i wait 300s from alb to watch for errors after /health.
+5. also we gave 300s  in ASG  --health-check-type ELB --health-check-grace-period 300. will that is waiting period + 2 thresould-count multiple 15s interval total 330s. i have to wait to see the results
+6. where healthy-thresould and unhealty threshold count used and how is useful.
+7. if i change status code to 404 with /health will those become healthy again and start serving.
+8. can i add listensers like / => 200 and /health => 400. both are ok to keep th app up.
+9. even after alb shows 2 unhealty instances and old instance were replaced. but curl http://web-alb-1851163941.us-east-1.elb.amazonaws.com gives status code 200 even after 20mins and also in incognito window. why
+ANSWER: I don't know exactly  But the thing is like  Asg is checking the better the VM is alive or not  And the target group is checking the path slash health is healthy or not so when slash health is not healthy it is asking ASG to replace those VMS  Um but the lb which I already giving default page fine is because  Slash  Run perfectly for the first time  I do not know the reason that is the question I have also had in my doubt's query
+SAVEDAT: 2026-10-26T06:25:47.279Z
+REVIEWED: true
+VERDICT: incomplete
+ASSESSMENT: Incomplete — you got the first half right and then explicitly stopped on the second half instead of reasoning it through, which is worth naming directly: "I don't know, that's the question I have" isn't an answer, even an attempted wrong one. The part you got right: because health-check-type is ELB, the target group's /health failures DO get reported to the ASG, and the ASG WILL act on them (replace the instances) — that's correctly reasoned and ties straight back to the ASG module. But the question's second half is the actual point of this round: why wouldn't replacing them fix anything? You've already done the hands-on work to answer this yourself — you proved on the ASG page that a broken launch template produces a systemic replace-loop, not a one-time fix. This is the exact same shape of problem, one layer up: nginx was never configured with a /health route on ANY instance built from this launch template, so every replacement instance the ASG launches will ALSO fail the /health check, identically, forever. You'll watch the ASG busily replace instances that never had anything wrong with them, while the actual problem (the health check path, or the missing route) sits untouched.
+CLARIFICATION: **The real answer:** expect the ASG to start replacing both instances once the unhealthy-threshold count is hit — and expect that to accomplish nothing, because the new instances come from the identical launch template and fail /health the same way. This is "systemic, not transient" from the ASG module, now showing up through the ALB instead of through a broken user-data script. **The actual fix** is one of: revert the health check path back to something real (`/`), or add an actual working `/health` route to the app and bake that into the launch template.
+
+**Your doubts, answered one by one:**
+
+1. **NLB/Gateway Load Balancer hands-on** — noted for later. Quick primer on Gateway Load Balancer since it's a genuinely different thing, not just "NLB v2": it's for transparently routing traffic through third-party virtual appliances (firewalls, intrusion detection) using GENEVE encapsulation on port 6081 — a different use case from ALB/NLB entirely (traffic *inspection*, not traffic *distribution* to your own app).
+
+2. **Checking ALB logs:** enable access logs — `aws elbv2 modify-load-balancer-attributes --load-balancer-arn <arn> --attributes Key=access_logs.s3.enabled,Value=true Key=access_logs.s3.bucket,Value=<your-bucket>`. Logs land in S3 roughly every 5 minutes, one line per request, including target processing time and response codes — not real-time, but invaluable for after-the-fact debugging.
+
+3. **Debugging "app is down" from the ALB side:** check `describe-target-health` first (the `Reason` field tells you *why* a target is unhealthy, not just that it is), then CloudWatch metrics — `UnHealthyHostCount`, `HTTPCode_Target_5XX_Count`, `TargetResponseTime` — then the access logs for the actual failing requests, then drop down to the instance itself only once the ALB-level signals point somewhere specific.
+
+4/5. **The 300s grace period and the 15s/2-count threshold do NOT add together the way you worked out — this is an important correction.** The ASG's `health-check-grace-period` only applies to a *freshly launched* instance — it suppresses health-check-driven replacement during the instance's first 300s of life, so a slow-booting app doesn't get killed before it's finished starting. Your two existing, already-`InService` instances are **not** newly launched, so the grace period doesn't apply to them at all here. What actually governs them is just the target group's own threshold math: `unhealthy-threshold-count` (2) × `health-check-interval-seconds` (15) ≈ 30 seconds for the target group to flip them to Unhealthy, then the ASG's own reconciliation loop (similar order of magnitude to the ~1 minute you saw for termination on the ASG page) to notice and start a replacement. Realistically under ~2 minutes total, not 330s — don't stack those two numbers, they answer different questions (one's about new instances, one's about already-running ones).
+
+6. **Healthy/unhealthy threshold counts, concretely:** `unhealthy-threshold-count` = how many *consecutive* failed checks before a currently-Healthy target flips to Unhealthy — set above 1 so a single transient blip doesn't yank a perfectly fine instance out of rotation. `healthy-threshold-count` = the mirror image — how many *consecutive* successes before a currently-Unhealthy target is trusted enough to flip back to Healthy, so one lucky response doesn't immediately re-admit something still flapping. Both exist purely to prevent flapping in either direction.
+
+7. **Changing the status code to 404 on /health — no, that does not help.** A health check only counts a response as successful if it falls in the configured "success codes" range (default is just `200`). 404 is still a failure regardless of what path returned it. The only ways to make it healthy again are: fix the path back to one that returns 200, add a real `/health` route that returns 200, or (not recommended) explicitly widen the target group's configured success-code range to include 404 — which is gaming the check, not fixing anything, and defeats the entire point of having one.
+
+8. **Listener rule returning a fixed response for /health (e.g. always 200) — technically possible, actively bad here.** ALB listener rules do support a `fixed-response` action that returns a canned status with no backend involved at all. Using that for your *health check path specifically* would make the ALB permanently blind on purpose — exactly re-creating the EC2-health-check blindness problem this whole module exists to fix, just moved up a layer. The legitimate version of this pattern is a real, lightweight `/health` endpoint actually served by the app (even a trivial one) — not a fixed response that bypasses the app entirely.
+
+9. **Why curl still returned 200 after 20 minutes, even in incognito — this is real, documented ALB behavior, not a caching artifact.** When **every single target in a target group is unhealthy**, the ALB doesn't fail the request — it "fails open" and routes to the targets anyway rather than returning an error to every client. Since `/` on those instances genuinely still works fine (only `/health` is broken), the request the ALB forwarded actually succeeded — hence your real 200, consistently, even though AWS considers every target Unhealthy. This is a deliberate AWS design choice (serving degraded traffic beats serving none), and it's exactly why `describe-target-health` — not "did curl work" — is the trustworthy signal for whether your health check config is actually correct.
+
+
+[STAGE fault-injection]
+HEADING: Fail-open and the churn window — three more faults, same real AWS account
+[P]
+You already ran the core fault for real while working through Round 1 — breaking the health check path and watching curl keep succeeding anyway. This section formalizes three deliberate variations on exactly that, each isolating one specific piece of what you asked about afterward: partial vs. total failure, the fail-open mechanism itself with clean before/after evidence, and the 502s that show up during instance churn.
+[CODE lang=bash caption="fault A: partial failure — break only ONE instance, confirm fail-open does NOT trigger"]
+# First, revert /health back to a passing path so you start from a clean state
+aws elbv2 modify-target-group --target-group-arn <target-group-arn> --health-check-path /
+# Then break only one instance's app, leaving the other alone
+# (SSH into just ONE of the two instances)
+sudo systemctl stop nginx
+aws elbv2 describe-target-health --target-group-arn <target-group-arn> \
+  --query 'TargetHealthDescriptions[].[Target.Id,TargetHealth.State]' --output table
+# Expect: one target Unhealthy, one still Healthy — NOT a fail-open situation
+for i in {1..10}; do curl -s -o /dev/null -w "%{http_code}\n" http://<alb-dns-name>; sleep 1; done
+# Expect: a clean, boring run of all 200s — the ALB is just quietly sending
+# everything to the one survivor, no fail-open involved at all
+[CODE lang=bash caption="fault B: total failure — both instances unhealthy, trigger fail-open on purpose"]
+# Restart the stopped instance's nginx, then break BOTH the same way as before
+sudo systemctl start nginx          # on the instance from fault A
+aws elbv2 modify-target-group --target-group-arn <target-group-arn> --health-check-path /health
+aws elbv2 describe-target-health --target-group-arn <target-group-arn> \
+  --query 'TargetHealthDescriptions[].[Target.Id,TargetHealth.State]' --output table
+# Expect: BOTH targets Unhealthy this time - 0% healthy, the actual fail-open trigger
+curl -i http://<alb-dns-name>        # expect a real 200 anyway, same as before
+[CODE lang=bash caption="fault C: watch for 502s during the ASG replacement churn"]
+# While both are still unhealthy and the ASG (health-check-type ELB) is actively
+# replacing them, hammer the ALB in a loop and watch the status codes
+for i in {1..30}; do curl -s -o /dev/null -w "%{http_code}\n" http://<alb-dns-name>; sleep 2; done
+# Expect: mostly 200s, but watch for an occasional 502 - that's a request landing
+# on an instance caught mid-termination or mid-launch, not a health-check issue
+[NOTE]
+The point of running all three: fault A proves fail-open is a 0%-healthy-only edge case, not general behavior. Fault B gives you clean, repeatable, on-purpose evidence of the exact thing that confused you originally. Fault C shows that fail-open guarantees the ALB will *try*, not that every attempt succeeds — real churn underneath can still produce real errors. Remember to fix the health check path back to `/` (or build a real `/health` route) once you're done experimenting, same cleanup discipline as every fault-injection exercise so far.
+
+[ROUND alb_r2]
+QUESTION: Run all three fault variations above. Report what describe-target-health and your curl loop actually showed for each - did fault A confirm fail-open does NOT trigger on a partial failure, did fault B give you clean repeatable fail-open evidence, and did fault C show any 502s mixed in with the 200s? If you saw 502s, were they during active ASG replacement or during a stable (not churning) unhealthy period?
+DOUBTS:
+ANSWER: Firstly I changed the engine escaped so that I can see  Instance ID  Availability Zone and public ID  On the nginx root page  Firstly I speak about fault a so the thing is like I did stop the nginx when I stop one of the engine X I see that only the load balancer is triggering the other server so there were no 502 errors there are only  200 errors 200 success codes for all the things so there is no fail so fail shape often here  Next I'll talk about fault B is like  Yeah I'll try to restart the nginx by the time I try to restart the engine exit is already went into terminating mode by Target groups so even after I started it it was already in terminated mode and the next thing is like  Ah it is started in new instance so basically it replaced in with new instance  And in fault B I did change the health check so that the both knew the old one and the new instance which was upcoming became unhealthy  So when then I try to curl Rose the curl and also I try to refresh the page so somewhere in between I did  Uh some 502 errors  So this confirms that fail shape has begun  Uh fail safe is has begin and it was started working  The one Keen interest that I observed is like  One of the instances become unhealthy the ALB is pushing  To  Up even after when both the instancer became in unhealthy  Uh the ALB is pushing the webpage to those instances until unless the new instance will come up  So there was a more differences like the D registration time in Target group is taking some time  And  Uh the tarnation time and replacing a is  Uh ASG is taking  Some more time to create a new one before terminating the old one so that the Gap is a little bit much old but the steel is like the LB is able to work with  Unhealthy and going to terminated instance also that was the observation that I did
+SAVEDAT: 2026-10-26T08:49:11.156Z
+REVIEWED: true
+VERDICT: correct
+ASSESSMENT: Correct, and genuinely strong experimental work — putting the instance ID/AZ/public IP on the nginx page itself before starting was a smart move nobody asked for, and it's exactly how this gets debugged for real (knowing *which* backend actually answered a given request). All three faults landed: fault A correctly showed zero 502s, all 200s, confirming fail-open does not trigger at 50% — the ALB just quietly used the one survivor. Fault C confirmed 502s appeared specifically while curling/refreshing during the churn window, not as some constant background noise — exactly the expected answer. Fault B is the most valuable result of the three precisely because it *didn't* go cleanly: you tried to recover the original instance by restarting nginx, and the ASG had already moved on without waiting for you — it had already decided to replace it and was mid-termination by the time you intervened. That's not a failed experiment, that's real infrastructure behavior: once the ASG commits to replacing something, your manual fix to the old instance doesn't un-commit it. A clean, obedient test environment would have hidden that lesson entirely.
+CLARIFICATION: Your closing observation ties together two things from earlier pages correctly, even though the wording got tangled: you noticed the ALB kept "pushing" traffic to an instance that was already unhealthy *and* already in the terminating/replacing process, not just to a stable pair of unhealthy instances. That's deregistration delay (from the pieces step) and fail-open overlapping — the ALB doesn't yank a target's traffic the instant it's marked unhealthy or the instant termination starts; there's a window where an about-to-die target can still legitimately receive and answer requests, on top of fail-open already ignoring health status entirely at 0%. That overlapping window — old instance not fully gone yet, new instance not fully up yet — is exactly where fault C's 502s came from: a request can land on either side of that gap and get a real failure, purely from timing, with nothing "wrong" in the health check configuration at all.
+
+One thing to make more explicit next time: you confirmed 502s showed up *during* the churn, but didn't separately check whether they *also* showed up during a stretch where nothing was actively replacing (both instances simply sitting Unhealthy, no termination/launch in progress). Based on the mechanism — 502 requires an actual broken connection or malformed response, and a *stable* unhealthy-but-still-answering instance keeps answering fine under fail-open — you should expect **no** 502s in that stable window, only during active churn. Worth verifying explicitly next time you're in a similar state, rather than inferring it: the stable-vs-churning contrast is usually the detail that actually convinces someone in an interview, not just "I saw some 502s."
+
+
+[STAGE conclusion]
+HEADING: The whole chain, finally closed
+[P]
+EC2 taught you the request path down to individual TCP packets. ASG taught you self-healing, and that a health check is only as good as what it actually inspects. This page closed the loop those two left open: real HTTP-level health checking via a target group, an ASG that finally reacts to it, and — not in the original plan, but more valuable for it — a direct, hands-on look at two edge cases that only show up under real failure conditions: fail-open at 0% healthy, and the real 502s that happen in the churn window between an old instance dying and a new one coming up.
+[P]
+One thing worth sitting with: nothing on this page was a bug. The EC2 health check being blind, the ALB fail-open behavior, the deregistration-delay window — every one of these is AWS working exactly as designed. The actual skill this whole series has been building isn't "memorize what breaks" — it's reading what a system is *actually checking* versus what you assumed it was checking, and reasoning from there instead of guessing.
+[P]
+What's still missing is the layer underneath all of this: every Security Group rule, every subnet, every `--vpc-zone-identifier` you've typed has been pointing at infrastructure that was just assumed to exist. VPC is next — the actual networking (subnets, route tables, NAT gateways, public vs. private) that every instance, ASG, and load balancer on this page has been quietly standing on the whole time.

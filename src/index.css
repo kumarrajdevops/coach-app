@@ -1,0 +1,163 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+    --font-heading: var(--font-sans);
+    --font-sans: 'Geist Variable', sans-serif;
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-chart-5: var(--chart-5);
+    --color-chart-4: var(--chart-4);
+    --color-chart-3: var(--chart-3);
+    --color-chart-2: var(--chart-2);
+    --color-chart-1: var(--chart-1);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-destructive: var(--destructive);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+    --color-success-foreground: var(--success-foreground);
+    --color-success: var(--success);
+    --color-warning-foreground: var(--warning-foreground);
+    --color-warning: var(--warning);
+    --color-code: var(--code);
+    --color-code-foreground: var(--code-foreground);
+    --radius-sm: calc(var(--radius) * 0.6);
+    --radius-md: calc(var(--radius) * 0.8);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) * 1.4);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --radius-3xl: calc(var(--radius) * 2.2);
+    --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+    /* DealPulse "light" theme, values taken directly from
+       dealpulse-theme-demo/index.html's --bg/--accent/etc. custom properties. */
+    --background: #f4f6fb;
+    --foreground: #111827;
+    --card: #ffffff;
+    --card-foreground: #111827;
+    --popover: #ffffff;
+    --popover-foreground: #111827;
+    --primary: #635bff;
+    --primary-foreground: #ffffff;
+    --secondary: #eef2f8;
+    --secondary-foreground: #1f2937;
+    --muted: #eef2f8;
+    --muted-foreground: #6b7280;
+    --accent: #ece9ff;
+    --accent-foreground: #4b3fcf;
+    --destructive: #d84b55;
+    --success: #0c9f6e;
+    --success-foreground: #ffffff;
+    --warning: #c98113;
+    --warning-foreground: #2b1a04;
+    --code: #12161f;
+    --code-foreground: #e7ebf5;
+    --border: rgba(17, 24, 39, 0.09);
+    --input: rgba(17, 24, 39, 0.09);
+    --ring: rgba(99, 91, 255, 0.5);
+    --chart-1: #635bff;
+    --chart-2: #12bfa4;
+    --chart-3: #f2a93b;
+    --chart-4: #d84b55;
+    --chart-5: #6b7280;
+    --radius: 1rem;
+    --sidebar: #eef2f8;
+    --sidebar-foreground: #111827;
+    --sidebar-primary: #635bff;
+    --sidebar-primary-foreground: #ffffff;
+    --sidebar-accent: #ece9ff;
+    --sidebar-accent-foreground: #4b3fcf;
+    --sidebar-border: rgba(17, 24, 39, 0.09);
+    --sidebar-ring: rgba(99, 91, 255, 0.5);
+}
+
+.dark {
+    /* DealPulse "dark" theme, same source file. */
+    --background: #0b0e14;
+    --foreground: #f1f5f9;
+    --card: #161b22;
+    --card-foreground: #f1f5f9;
+    --popover: #161b22;
+    --popover-foreground: #f1f5f9;
+    --primary: #8b7cff;
+    --primary-foreground: #0f0c24;
+    --secondary: #202733;
+    --secondary-foreground: #e5e9f0;
+    --muted: #202733;
+    --muted-foreground: #8d98a8;
+    --accent: #2b2748;
+    --accent-foreground: #c9c2ff;
+    --destructive: #ff6974;
+    --success: #35d39b;
+    --success-foreground: #072218;
+    --warning: #e5a84e;
+    --warning-foreground: #2b1b03;
+    --code: #0a0d13;
+    --code-foreground: #dbe2ee;
+    --border: rgba(255, 255, 255, 0.1);
+    --input: rgba(255, 255, 255, 0.15);
+    --ring: rgba(139, 124, 255, 0.5);
+    --chart-1: #8b7cff;
+    --chart-2: #2dd4bf;
+    --chart-3: #f4b860;
+    --chart-4: #ff6974;
+    --chart-5: #8d98a8;
+    --sidebar: #161b22;
+    --sidebar-foreground: #f1f5f9;
+    --sidebar-primary: #8b7cff;
+    --sidebar-primary-foreground: #0f0c24;
+    --sidebar-accent: #2b2748;
+    --sidebar-accent-foreground: #c9c2ff;
+    --sidebar-border: rgba(255, 255, 255, 0.1);
+    --sidebar-ring: rgba(139, 124, 255, 0.5);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    }
+  body {
+    @apply bg-background text-foreground antialiased;
+    }
+  html {
+    @apply font-sans;
+    }
+  ::selection {
+    @apply bg-primary/25 text-foreground;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

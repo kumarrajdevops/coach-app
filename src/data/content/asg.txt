@@ -1,0 +1,192 @@
+MODULE: asg
+TITLE: ASG
+COVERED: 2026-10-24
+
+[STAGE knowledge]
+HEADING: The 2am problem a single EC2 instance can't solve
+[P]
+Your EC2 instance from the last lesson works — right up until the night real traffic triples during a launch and it falls over, or someone fat-fingers a termination in the console and the whole site goes down until a human notices and relaunches it by hand. A single hand-launched instance has no way to react to either problem on its own — it can't add capacity under load, and nothing is watching to replace it if it dies. That's the actual gap an Auto Scaling Group (ASG) closes: a declared range of how many instances should exist, kept true automatically, with no one paged at 2am to do it by hand.
+
+[STAGE pieces]
+HEADING: Launch templates, min/desired/max, scaling policies, health checks
+[DIAGRAM nodes="Client|Load Balancer|Target Group|ASG|EC2 instance" highlight="ASG"]
+[DEFS]
+Launch template :: the actual instance definition an ASG uses whenever it needs to create a new instance — AMI, instance type, key pair, Security Group, user-data, all of it, identical to what you launched by hand in the EC2 lesson. Launch configurations are the older, now-legacy version; AWS no longer lets you create new ones — always use a launch template.
+Min / Desired / Max capacity :: the three numbers that define an ASG's range. **Min** is the floor — it will never scale below this even with zero traffic. **Max** is the ceiling — a safety cap so a scaling bug can't launch hundreds of instances and run up a huge bill overnight. **Desired** is the current target the ASG is actively trying to maintain right now, and moves between min and max as scaling policies fire.
+Scaling policy :: the rule that decides when desired capacity changes. **Target tracking** is the default to reach for — "keep average CPU at 60%" — and AWS works out the add/remove math itself, like a thermostat. **Step scaling** is manual: you define exact thresholds and exact instance-count changes yourself. **Scheduled scaling** changes desired capacity at specific times (e.g. scale up before a known Monday-morning spike) and doesn't react to metrics at all.
+Health check type: EC2 vs ELB :: by default an ASG only asks "is this instance's EC2 status check passing" — is the VM itself alive. It has **no idea** whether the app inside is actually working. Setting the health check type to **ELB** instead makes the ASG ask the load balancer's own target-group health check — an actual HTTP request to your app — which is the one that catches "the instance is up but nginx crashed." We'll hit exactly this gap in the troubleshoot step below.
+[TABLE]
+ | Launch template | Launch configuration
+Introduced | 2017, the current standard | The original (2013) mechanism — legacy now
+Mutability | Versioned — create v1, v2, $Latest, roll back anytime, the ASG just tracks a version | Immutable — to change anything you must create an entirely new one and repoint the ASG at it
+Mixed instances / Spot+On-Demand | Supports a mixed instances policy — one ASG spanning several instance types and blending Spot with On-Demand for cost savings | Cannot do this at all — one instance type, one purchase option, full stop
+New feature support | Gets every new EC2 launch feature as AWS ships it (placement groups, multiple ENIs, newer burst/credit options, etc.) | Frozen — missing most capabilities added since 2017
+Can you still create new ones? | Yes, always | No — AWS blocks creating new launch configurations in current accounts; only pre-existing ones keep working
+[NOTE]
+Why this is worth knowing precisely, not just "templates are newer": the mixed-instances/Spot capability is the real dealbreaker, not versioning convenience. An ASG that wants to blend cheaper Spot capacity with a baseline of On-Demand instances — a very common real cost-optimization pattern — is only possible on a launch template. A launch configuration structurally cannot express it. If you ever inherit an ASG still running on a launch configuration, migrating it to a launch template isn't just tidiness — it's unlocking capabilities that were never available before.
+
+[STAGE hands-on]
+HEADING: Launching a healthy, self-maintaining ASG via CLI
+[P]
+Same Security Group and key pair from the EC2 lesson — this builds directly on that, not a fresh setup.
+[CODE lang=bash caption="1. create a launch template — the same instance definition as the manual EC2 launch"]
+aws ec2 create-launch-template \
+  --launch-template-name web-template \            # name referenced by the ASG below
+  --version-description "nginx web server" \        # human-readable note on this version
+  --launch-template-data '{
+    "ImageId": "ami-0abcd1234efgh5678",              # same AMI as the manual EC2 lesson
+    "InstanceType": "t3.micro",
+    "SecurityGroupIds": ["sg-0123456789abcdef0"],    # the web-sg from the EC2 lesson
+    "KeyName": "your-keypair-name",
+    "UserData": "<base64-encoded nginx install script from the EC2 lesson>"
+  }'
+[CODE lang=bash caption="2. create the ASG itself — min=2, desired=2, max=4"]
+aws autoscaling create-auto-scaling-group \
+  --auto-scaling-group-name web-asg \               # the ASG's name
+  --launch-template "LaunchTemplateName=web-template,Version=\$Latest" \ # always track the latest template version
+  --min-size 2 --desired-capacity 2 --max-size 4 \  # the min/desired/max trio from the pieces step
+  --vpc-zone-identifier "subnet-aaa,subnet-bbb"     # spread across 2 subnets/AZs — one AZ dying shouldn't take the whole fleet down
+[CODE lang=bash caption="3. confirm it's healthy — 2 instances, both InService"]
+aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names web-asg \
+  --query 'AutoScalingGroups[0].Instances[].[InstanceId,LifecycleState,HealthStatus]' --output table
+# Expect two rows, both "InService" / "Healthy" — the ASG launched exactly `desired-capacity`
+# instances on its own, no manual run-instances call needed
+
+[STAGE troubleshoot]
+HEADING: "Healthy" according to the ASG, down for real users
+[P]
+You SSH into one of the two running instances and find nginx isn't running — the same user-data-silently-failed gap from the EC2 lesson. But this time, check the ASG's own view of that instance first:
+[CODE lang=bash caption="what the ASG itself thinks of the broken instance"]
+aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names web-asg \
+  --query 'AutoScalingGroups[0].Instances[].[InstanceId,HealthStatus]' --output table
+# The broken instance still shows "Healthy" — the ASG has no idea anything is wrong
+
+[STAGE key-insight]
+HEADING: Why the ASG didn't notice
+[NOTE]
+This is a direct, real consequence of the health-check-type setting from the pieces step, not a hypothetical. With the default EC2 health check, the ASG is only ever asking AWS's own hypervisor "is this VM still running" — it never makes an HTTP request, so it genuinely cannot see that nginx crashed. The instance can sit there broken, counted as healthy, taking its share of traffic and returning nothing, until a human notices. Setting the health check type to ELB (which needs a target group — the ALB & NLB page builds that next) is what actually closes this gap, because then the ASG's definition of "healthy" becomes "the load balancer's own HTTP health check against this instance is passing," not just "the VM booted."
+
+[ROUND asg_r1]
+QUESTION: Your ASG shows both instances as "Healthy" in describe-auto-scaling-groups, but real users report the site is down, and you've confirmed nginx isn't running on one of them. Why didn't the ASG catch this and replace the instance automatically — and what's the actual fix (not just "restart nginx")?
+DOUBTS:
+ANSWER: Asg will only check  Vm is still running or not  That is the only work that it is dependent on it will never check the HTTP health check  Given  Elb so elb uses Target group  And it will have  The health HTTP health check  And it reports back to the AAC if health check is good  Asg keeps the VM  If health check fails then ASG will restart other container  So this will come to be a part of  Target groups and elbs  Attached to ASG
+SAVEDAT: 2026-10-25T09:27:27.828Z
+REVIEWED: true
+VERDICT: partial
+ASSESSMENT: Partial credit — the core diagnosis and the general direction of the fix are both right, but the mechanics are fuzzy in a couple of places the question specifically asked you to nail down. You correctly identified that the default ASG health check only asks "is the VM alive," never makes an HTTP request, and that the real fix routes through a target group's HTTP health check reporting back to the ASG — that's the right mental model. Two things to tighten: (1) you said ASG will "restart" the instance — it doesn't restart anything in place, it terminates the unhealthy instance and launches a brand-new one from the launch template to replace it. That distinction actually matters: if the failure is baked into the launch template/user-data itself (not a one-off crash), the replacement instance will fail the exact same way, forever. (2) "this will come to be a part of target groups and ELBs attached to ASG" gestures at the fix but doesn't say it — the question asked for the actual fix, which is two explicit configuration steps, not just an association.
+CLARIFICATION: **The actual fix, concretely:** (1) create a target group with an HTTP health check (e.g. path `/`, a healthy/unhealthy threshold, a check interval) and register the ASG's instances with it. (2) Explicitly set the ASG's health check type to ELB — being behind a target group alone doesn't change what the ASG listens to: `aws autoscaling update-auto-scaling-group --auto-scaling-group-name web-asg --health-check-type ELB --health-check-grace-period 300`. The grace period matters too — it tells the ASG to ignore health check failures for the first N seconds after a new instance launches, so a slow-booting app doesn't get flagged unhealthy before it's even finished starting.
+
+**On "restart" vs "replace":** this isn't just a word choice — an ASG's self-healing is terminate-and-replace-from-template, never an in-place restart. That's exactly why a failure baked into the launch template (a broken user-data script, for instance) defeats ASG self-healing entirely — every replacement instance boots from the same broken template and fails identically. ASG protects you from *transient* failures (a process crashing, a host dying) — it cannot protect you from a *systemic* one baked into what it's deploying. That's a real interview distinction: "does ASG make your deployment reliable" — no, it makes a reliable deployment *resilient*; it doesn't fix a broken one.
+
+You were right that target groups/ELB are the mechanism — just make the actual two-step config explicit next time a question asks for "the fix," not just the general direction.
+
+
+[STAGE fault-injection]
+HEADING: Proving self-healing — and proving the health-check gap — for real
+[P]
+Two experiments, both on your real `web-asg`. The first proves the thing ASG actually promised in the knowledge step (self-healing against a dead instance); the second re-confirms, empirically, the exact gap Round 1 was about — you're still on the default EC2 health check right now, so this should fail to self-heal, on purpose.
+[CODE lang=bash caption="fault 1: terminate an instance directly — does the ASG notice and replace it?"]
+aws ec2 terminate-instances --instance-ids <one-of-the-two-instance-ids>
+# Poll every 15-20s:
+aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names web-asg \
+  --query 'AutoScalingGroups[0].Instances[].[InstanceId,LifecycleState,HealthStatus]' --output table
+# Expect: within roughly a minute, a brand-new InstanceId appears with LifecycleState
+# "Pending" -> "InService" — the ASG noticed the deficit (desired=2, actual=1) and
+# launched a replacement from the launch template on its own, no human involved
+[CODE lang=bash caption="fault 2: kill nginx again — still on the default EC2 health check"]
+# SSH into the remaining original instance
+sudo systemctl stop nginx
+# Then watch the same describe-auto-scaling-groups command as above
+# Expect: HealthStatus stays "Healthy" and LifecycleState stays "InService" —
+# nothing happens, no replacement, no new instance — confirming Round 1's
+# diagnosis for real, not just in theory
+[NOTE]
+You won't fix fault 2 on this page — actually closing it needs a target group and an ELB-type health check wired to the ASG, and that's exactly what the ALB & NLB page builds next. Treat this round as confirming the problem is real with your own eyes; the fix gets verified for real once that page exists.
+
+[ROUND asg_r2]
+QUESTION: Run both fault-injection experiments above on your real ASG. For each one, report what you actually observed — did a replacement instance appear (and roughly how long did it take), and did the HealthStatus/LifecycleState change at all when nginx was killed under the default health check type? Did both match the predictions?
+DOUBTS:
+ANSWER: Yes I run both fault injection experiments ago on my real ASG  I observed that replacement did happen and roughly it took one minute but one thing I need to clean here out is  It took around one minute to re do the replacement and also the ags does not know whether the instance is terminated or while terminating only after Terminator it came to know that the instance is down and it reproduced one more instance  Uh next fault injection is nginx I did SSH into the ec2 instance and stopped it and still it showed  Status of  Status of Auto scaling group  Healthy and in service  And yes both did match the predictions
+SAVEDAT: 2026-10-25T11:03:33.579Z
+REVIEWED: true
+VERDICT: correct
+ASSESSMENT: Correct — both experiments ran clean and both outcomes matched the predictions exactly. Fault 1: instance terminated directly, replacement appeared in ~1 minute, desired capacity restored with no human involved — the actual self-healing promise, verified for real. Fault 2: nginx killed under the default EC2 health check, ASG kept reporting Healthy/InService — nothing happened, confirming Round 1's diagnosis wasn't just theory. Your observation about the timing on fault 1 (the ASG only "finding out" after the instance had actually finished terminating, not sooner) is a real and correct detail, and it's worth being precise about why — see the clarification.
+CLARIFICATION: **Why fault 1 and fault 2 behave so differently, mechanically:** fault 1 (direct termination) is a *state change AWS itself tracks* — EC2 knows immediately that the instance is gone, and the ASG reconciles "desired=2, actual=1" against that authoritative state on its own polling cycle, which is where your ~1 minute came from. It's not a health-check delay — it's "the instance now provably doesn't exist." Fault 2 is completely different: the instance still *exists* and still *passes* the only check being asked (EC2 status check, "is the VM alive") — so there's no delay to wait out, because there's no failing signal at all. The ASG isn't slow to notice fault 2 — it is permanently blind to it until the health check type changes.
+
+**Your doubts, answered:**
+
+1. **Transient vs. systemic failures:** *Transient* = something that goes wrong with one instance, independent of the others — a process crashing, a host having a bad day, a brief resource spike. Replacing that one instance genuinely fixes it. *Systemic* = a bug baked into what every instance is built from — a broken user-data script, a bad AMI, a config error in the launch template. Every replacement instance inherits the exact same bug and fails the exact same way; ASG will cheerfully replace it forever without ever fixing anything, which is exactly the trap from Round 1's clarification.
+
+2. **How to stop/remove an instance from an ASG on purpose** (without it immediately being replaced): don't just `terminate-instances` directly unless you want the replacement — that's what triggered fault 1. To remove one instance without a replacement, lower desired capacity first, or use `aws autoscaling terminate-instance-in-auto-scaling-group --instance-id <id> --should-decrement-desired-capacity` (removes it *and* adjusts desired capacity down by one, so the ASG doesn't launch a replacement). To pull an instance out temporarily for inspection — without terminating it or touching desired capacity — use `aws autoscaling enter-standby --instance-ids <id> --auto-scaling-group-name web-asg --should-decrement-desired-capacity`; the ASG stops counting it and launches a replacement to cover it, but your original instance stays alive and untouched for you to debug.
+
+3. **Debugging a systemic replace-loop** (every new instance dies the same way): the hard part is the instance disappears before you can look at it. Use `enter-standby` (above) the moment you see a new instance come up, before the ASG decides it's unhealthy and recycles it — that freezes it for inspection. Then check `/var/log/cloud-init-output.log` (the user-data script's actual output/errors) and `systemctl status <your service>`. Also check `aws autoscaling describe-scaling-activities --auto-scaling-group-name web-asg` — the `StatusMessage` field on recent activities often states directly why an instance was terminated/replaced.
+
+4. **LifecycleState** is the ASG's own answer to "what stage of its life is this instance in" — `Pending` (launching, not yet serving traffic or counted as InService) → `InService` (actively running and counted toward desired capacity) → `Terminating` → `Terminated`. This is a different axis from **HealthStatus** (`Healthy`/`Unhealthy`) — LifecycleState is *where in its lifecycle* the instance is; HealthStatus is *whether the ASG currently considers it good*. An instance can be `InService` and still `Unhealthy` for a moment before the ASG acts on it — they're tracked and reported separately, which is exactly why your `describe-auto-scaling-groups` queries pulled both columns.
+
+
+[STAGE fault-injection]
+HEADING: A real systemic replace-loop
+[P]
+A teammate pushes a "quick fix" to the launch template — renames the key pair, or points at a Security Group that got deleted last week — and ships it without testing. Every single new instance the ASG tries to launch now fails for the exact same reason. This is the systemic failure from Round 1's clarification, made real: worth seeing what it actually looks like in `describe-scaling-activities` before you hit it for real at 2am.
+[CODE lang=bash caption="1. break the launch template on purpose — point it at a key pair that doesn't exist"]
+aws ec2 create-launch-template-version \
+  --launch-template-name web-template \
+  --source-version 1 \                         # base the new version on version 1
+  --launch-template-data '{"KeyName": "definitely-does-not-exist"}' \ # the broken field
+  --version-description "BROKEN on purpose - bad key name"
+# This becomes the new $Latest version — the ASG's launch template config
+# already tracks $Latest, so it'll be used for the next launch attempt
+[CODE lang=bash caption="2. force the ASG to launch against the broken version"]
+aws autoscaling start-instance-refresh --auto-scaling-group-name web-asg
+# This cycles every instance through the current $Latest template version —
+# i.e. the broken one
+[CODE lang=bash caption="3. watch it fail, repeatedly, for the same reason every time"]
+aws autoscaling describe-scaling-activities --auto-scaling-group-name web-asg \
+  --query 'Activities[0:5].[StatusCode,StatusMessage]' --output table
+# Expect StatusCode "Failed" on repeated activities, and StatusMessage naming
+# the exact problem: the key pair doesn't exist. No instance ever reaches
+# InService - desired capacity never gets restored while this is broken
+[CODE lang=bash caption="4. fix it — point back at a real key pair, confirm recovery"]
+aws ec2 create-launch-template-version \
+  --launch-template-name web-template \
+  --source-version 1 \
+  --launch-template-data '{"KeyName": "your-keypair-name"}' \ # the real key pair again
+  --version-description "fixed - restored real key name"
+aws autoscaling start-instance-refresh --auto-scaling-group-name web-asg
+# Then re-check describe-auto-scaling-groups — both instances should reach
+# InService / Healthy again
+[NOTE]
+Notice what's different from the nginx fault earlier: that one never showed up anywhere in the ASG's own tooling, because the instance successfully existed and passed the only check being asked. This one shows up immediately and explicitly in describe-scaling-activities, because the failure happens at launch time, before an instance even exists to be falsely marked healthy. Same underlying lesson as the whole page: the ASG can only ever react to what it's actually told to check — a launch-time failure it always sees; an in-instance app failure it's blind to until the health check type changes.
+
+[ROUND asg_r3]
+QUESTION: Run the broken-launch-template exercise above for real. What did describe-scaling-activities actually show (the exact StatusMessage), did desired capacity ever get restored while it was broken, and why does this failure mode show up in the ASG's own tooling when the earlier nginx failure didn't?
+DOUBTS: I observed this
+Auto Scaling Group is trying to launch t3.micro in us-east-1e, but AWS rejects the request because that instance type is not supported for your launch request in that zone.
+
+Your AWS Global View shows that us-east-1e exists and its health state is Available. This means the zone itself is available; it does not guarantee that every EC2 instance type can launch there.
+
+Verify the instance-type offerings:
+aws ec2 describe-instance-type-offerings \
+  --region us-east-1 \
+  --location-type availability-zone \
+  --filters Name=instance-type,Values=t3.micro \
+  --query 'InstanceTypeOfferings[*].Location' \
+  --output table
+ANSWER: i ran and those activity show that key-pair does not exist and desiresed capacity never reached. Actualy it never checked state to reach that capacity. it failed at launch template verification only. instant refresh did struck onetime from version to 2-3. it showed in asg's own tooling because it was lanch template verification failed. not instance level as like ngingx. even though nginx is behind instance.
+SAVEDAT: 2026-10-25T12:10:46.160Z
+REVIEWED: true
+VERDICT: correct
+ASSESSMENT: Correct, and you picked up a real detail I didn't ask about. The core answer is right on all three parts: the activity history named the missing key pair exactly, desired capacity never recovered while broken, and you correctly identified *why* — this is a launch-time/template-validation failure, not an instance-level one, so the ASG never gets far enough to falsely mark anything healthy the way it did with nginx. The extra observation — instance refresh getting "stuck" partway through (version 2 to 3) — is a genuine, accurate thing you ran into live, not a mistake, and it's worth a proper answer since it's a real operational detail: see the clarification.
+CLARIFICATION: **On the "stuck" instance refresh:** that's expected, and it has its own separate status you can check — `start-instance-refresh` isn't tracked only through `describe-scaling-activities`, it has its own tracker: `aws autoscaling describe-instance-refreshes --auto-scaling-group-name web-asg`. When every replacement attempt fails (as it did here, since the key pair was broken), the refresh can't make progress — it'll report status `Failed` or stay `InProgress` indefinitely depending on timing, exactly the "stuck" behavior you saw. For future reference: if a refresh seems hung, check `describe-instance-refreshes` first (it tells you the refresh's own state and percentage complete) before diving into `describe-scaling-activities` (which tells you *why* individual instance launches are failing) — they answer different questions and you'll usually want both.
+
+**Your new doubt, for future reference — instance type not supported in an AZ:** your own diagnosis and fix are exactly right. A regional instance type like `t3.micro` isn't guaranteed to be offered in every Availability Zone, and this is easy to get tripped up by because of a genuinely confusing AWS quirk: **AZ names like `us-east-1e` don't map to the same physical datacenter across different AWS accounts.** AWS deliberately shuffles the name-to-physical-location mapping per account to spread load evenly across the region. So "us-east-1e" showing as `Available` just means that slot is up — it says nothing about which instance types that particular physical AZ (for your account specifically) happens to support. `describe-instance-type-offerings` with `--location-type availability-zone` is exactly the right tool — it tells you the truth for your own account's AZ mapping, not a generic answer you could find in docs.
+
+**The actual fix, two options:** (1) narrow `--vpc-zone-identifier` on the ASG to only the subnets/AZs that actually offer the instance type (drop the problematic one), or (2) pick an instance type with broader availability if you don't have a hard requirement for `t3.micro` specifically. Option 1 is usually better — you want the ASG constrained to AZs you've *confirmed* work, not hoping every AZ behaves the same.
+
+
+[STAGE conclusion]
+HEADING: What ASG alone still can't do
+[P]
+You can now launch a self-healing fleet instead of a single instance, read its own activity history to diagnose exactly why a launch failed, and you've proven two very different failure classes with your own hands: a transient one (direct termination) that self-heals cleanly, and a systemic one (a broken launch template) that the ASG's own tooling surfaces clearly through `describe-scaling-activities` and `describe-instance-refreshes`.
+[P]
+What's still unsolved is the gap from Round 1: an in-instance app crash that leaves the VM itself perfectly healthy. The ASG can't close that on its own — it needs something that actually asks the app "are you working," not just "are you alive." That's exactly what a load balancer's target group provides, and it's what the next page builds: wiring an ALB in front of this ASG, switching the health check type to ELB, and finally closing the one gap that's followed this whole module from the start.

@@ -1,0 +1,153 @@
+MODULE: ec2
+TITLE: EC2
+COVERED: 2026-10-24
+
+[STAGE knowledge]
+HEADING: "I launched an EC2 instance and can't reach it"
+[P]
+"I launched an EC2 instance and can't reach it" is probably the single most common first debugging scenario in this field — and a great teaching vehicle because the failure can be at any of several independent layers. An interviewer asking you to troubleshoot an unreachable instance is testing whether you understand the *path* a request takes, not just AWS terminology.
+
+[STAGE pieces]
+HEADING: The pieces: EC2, Security Group, public IP, user-data
+[DIAGRAM nodes="Client|Internet Gateway|Security Group|EC2 instance" highlight="Security Group|EC2 instance"]
+[DEFS]
+EC2 instance :: Think of it as renting a computer that lives in AWS's data center instead of on your desk — you pick its size and OS, and it runs 24/7 until you stop it. Under the hood it's a virtual machine carved out of a physical host shared with other customers' instances (multi-tenant), which is exactly why the instance type (`t3.micro`, `m5.large`, ...) matters — it's your slice of that host's CPU/RAM/network, and picking the wrong one is a real cost and performance lever interviewers expect you to reason about, not just name.
+Security Group (SG) :: Think of a Security Group like a bouncer standing at the door of your instance, checking every connection attempt against a guest list before letting it through. **Stateful** means: once you've let a connection IN on an allowed port, its reply traffic is automatically let back OUT — you never write a separate outbound rule just to let a response leave. That's the opposite of a Network ACL, which is *stateless* and needs explicit rules in both directions — a distinction interviewers like to ask about directly because it's easy to get backwards under pressure.
+Key pair :: The SSH keypair used to log into the instance — AWS stores the public half, you keep the private half (the `.pem` file) safe on your own machine. Losing it generally means losing SSH access to that instance for good, which is why production setups increasingly favor **SSM Session Manager** instead — it needs no key pair and no open port 22 at all.
+Public IP :: Without a public IP (or a persistent Elastic IP), nothing outside the VPC can reach the instance directly — it's effectively locked inside AWS's private network. A plain public IP is reassigned every time you stop/start the instance; an **Elastic IP** is the same idea but pinned permanently to your account, which matters the moment something needs a stable DNS record pointing at it.
+User data :: A script EC2 runs automatically, exactly once, the very first time the instance boots — how we get nginx installed and running without ever manually SSHing in. It only runs once by default (not on every reboot), and if it silently fails, the instance still shows "running" in the console with nothing actually listening — exactly the kind of gap a real troubleshooting question is built around.
+
+[STAGE hands-on]
+HEADING: Launching a reachable web server via CLI
+[P]
+CLI fluency matters more than console-clicking for the interview, so this is built with `aws` CLI commands end to end.
+[CODE lang=bash caption="1. create a Security Group in your default VPC"]
+aws ec2 create-security-group \
+  --group-name web-sg \                     # the SG's name — referenced by later commands
+  --description "Allow SSH and HTTP"        # just metadata, shown in the console
+# Output includes a GroupId like sg-0123456789abcdef0 — note it down, you need it below
+[CODE lang=bash caption="2. allow inbound HTTP (80) from anywhere — this is a public web server"]
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-0123456789abcdef0 \         # the SG created above
+  --protocol tcp --port 80 --cidr 0.0.0.0/0 # 0.0.0.0/0 = any IP on the internet
+[CODE lang=bash caption="3. allow inbound SSH (22) from ONLY your own IP — never 0.0.0.0/0 for SSH"]
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-0123456789abcdef0 \
+  --protocol tcp --port 22 --cidr $(curl -s ifconfig.me)/32  # your current public IP only
+[CODE lang=bash caption="4. launch the instance with user-data that installs and starts nginx on first boot"]
+aws ec2 run-instances \
+  --image-id ami-0abcd1234efgh5678 \        # an Amazon Linux 2023 AMI for your region — look up the current one
+  --instance-type t3.micro \                # free-tier eligible size
+  --security-group-ids sg-0123456789abcdef0 \ # attaches the SG created above
+  --associate-public-ip-address \           # without this, nothing outside the VPC can reach it
+  --user-data '#!/bin/bash
+dnf install -y nginx                        # Amazon Linux 2023 uses dnf, not yum
+systemctl enable --now nginx' \             # start nginx now AND on every future boot
+  --key-name your-keypair-name              # must already exist — create one first if you haven't
+[CODE lang=bash caption="5. once it's running, get its public IP and test it"]
+aws ec2 describe-instances --instance-ids i-0123456789abcdef0 \
+  --query 'Reservations[0].Instances[0].PublicIpAddress' --output text
+
+curl http://<that-public-ip>                # should return nginx's default HTML page
+
+[STAGE troubleshoot]
+HEADING: Troubleshooting an unreachable instance
+[P]
+Read this *after* attempting the round below, not before — the point is to reason through it yourself first.
+[P]
+When `curl`/the browser can't reach a public IP at all (hangs, no response — different from "connection refused", which means something IS listening but rejecting), work through the request's actual path in order:
+[NUMBERED]
+**Security Group** — is the right port/protocol open, from the right source CIDR? The most common cause, and the first thing to check since it's checkable from outside the instance entirely.
+**Public IP actually assigned** — `describe-instances` really shows a `PublicIpAddress`, not just that you *intended* `--associate-public-ip-address`; a subnet with auto-assign-public-IP disabled can silently skip it.
+**Network ACL** — subnet-level, stateless, default allows all traffic both directions. Rarely the actual cause unless someone customized it, but it exists, and interviewers like to mention it as the "forgotten" layer.
+**User-data silently failed** — the instance can be `running` while nginx never actually started. Connect via SSH or **SSM Session Manager** (no key pair/open port needed) and check `systemctl status nginx` and `/var/log/cloud-init-output.log` for the user-data script's real output/errors.
+**OS-level firewall** — `firewalld`/`iptables` on the instance itself. Usually off by default on Amazon Linux, but worth ruling out.
+
+[STAGE key-insight]
+HEADING: Why some failures hang and others refuse instantly
+[NOTE]
+The diagnostic order matters: Security Group first because it's the most common cause and fastest to check from outside the instance; user-data/app-level last because it requires actually connecting to the instance. Don't jump straight to "the app must be broken" before ruling out the network path — that's the classic wasted-time mistake under interview pressure.
+[DEFS]
+SYN ("synchronize") :: The first packet of a TCP handshake. The client sends this to say "I want to open a connection" — it carries no data, just a flag and a starting sequence number.
+SYN-ACK :: The server's reply, only sent if something is actually listening on that port. It's two things combined: "ACK, I got your SYN" + "here's my own SYN back." This is step 2 of the standard 3-way handshake (SYN -> SYN-ACK -> ACK).
+RST ("reset") / TCP-RST :: A different kind of reply: "there is no connection here, abandon this immediately." When a SYN arrives for a port nothing is listening on, the OS sends an RST instead of a SYN-ACK — that's exactly what curl reports as exit code 7, connection refused. "TCP-RST" is the same packet, just the more explicit name (TCP's RST flag) — not a separate thing from "RST".
+[BULLETS]
+**nginx stopped**: SYN arrives, the OS has no process on port 80, the OS immediately replies **RST** -> curl gets refused in seconds.
+**SG/firewalld blocking**: the SYN arrives (or never arrives at all, if truly dropped) and gets **no reply whatsoever** — not SYN-ACK, not RST, nothing — so the client just keeps retrying until it gives up.
+
+[ROUND ec2_r1]
+QUESTION: You've done all of the above, curl http://<public-ip> times out completely (no response, no connection refused — just hangs). The instance shows as "running" in the console. What are the two most likely causes, and which one would you check first?
+DOUBTS: ingress
+cidr
+how to create keyfile using cli
+aws ec2 create-key-pair \
+  --key-name learning-ec2-key \
+  --key-type rsa \
+  --key-format pem \
+  --query 'KeyMaterial' \
+  --output text > learning-ec2-key.pem
+ANSWER: Okay I will start with easy to Security Group first  And I will look into the port numbers and protocols and http protocol accurately so whether it is accessible by outside  Vpcr outside Network or not  Uh next thing is like if everything is good then I'll check with  I'll check with  Us our data  Uh means I'll just log into the ec2 instance and  I will check whether those  App is a status is upper running or not if not I'll just try to manually run it up and then later I will locate the user data how it was means  Went into  And then I'll fix it  I'll fix the user data
+SAVEDAT: 2026-10-24T11:50:34.473Z
+REVIEWED: true
+VERDICT: partial
+ASSESSMENT: Partial credit. Good instinct and the right order — Security Group first is exactly right, and checking from the outside in before touching the instance is the correct discipline. But the second cause doesn't match the actual symptom given. The question specifically says the connection *hangs with no response at all* — not "connection refused". Those are two different signals: a refused connection means the packet reached the OS and something answered "nobody's listening here" (a TCP RST) — that's what you'd see if nginx/user-data failed. A hang means the packet is being silently dropped somewhere before it ever reaches a listening-or-not port — that points to the Security Group, NACL, or routing/public IP, not the app itself. Your second guess (user-data/app not running) is a real thing to check eventually, but it wouldn't produce *this* symptom — and that distinction is exactly what separates someone reasoning from the actual evidence from someone pattern-matching to "thing I remember from the lesson."
+CLARIFICATION: **The two causes that actually fit a true hang:** (1) **Security Group** — wrong port/protocol/source CIDR, correctly your first check. (2) **No public IP actually assigned** (or the wrong one) — if `--associate-public-ip-address` didn't actually take (e.g. the subnet's auto-assign setting overrides it), there's literally no route to the instance, so the packet goes nowhere and you just wait. Both of these cause *silent drops* — nothing ever answers, so the client just times out.
+
+**Why "user-data failed" doesn't fit this symptom:** if nginx never started, the OS is still there, the Security Group still lets the SYN through, and the OS actively replies "nothing's listening on port 80" — that's **connection refused**, which comes back almost instantly, not a hang. A hang means something *before* the OS is silently eating the packets.
+
+**Rule of thumb for the interview:** "hangs / no response at all" -> look at the network layers (SG, NACL, routing/public IP) — nothing ever got the chance to say no. "Connection refused" -> the network layer is fine, look at the app/OS layer (user-data, is the process actually running, OS firewall) — something said no on purpose.
+
+**Your doubts, answered:**
+- **Ingress** = inbound traffic — traffic coming INTO the instance. That's why the command is `authorize-security-group-ingress`: you're allowing traffic in, not controlling what the instance sends out (egress, which is open by default).
+- **CIDR** = Classless Inter-Domain Routing notation, e.g. `0.0.0.0/0` (any IPv4 address) or `203.0.113.5/32` (exactly one address — the `/32` means "all 32 bits must match", i.e. no range at all). The `/32` on your own IP is exactly what restricts SSH to just you.
+- **Your key-pair command is correct.** One thing missing: right after creating it, run `chmod 400 learning-ec2-key.pem`. Without that, SSH will flat-out refuse to use the key ("UNPROTECTED PRIVATE KEY FILE" error) because the file is readable by other users on your machine by default.
+
+One delivery note since this was dictated: in the real interview, trim it down to the two causes and the check-first answer directly — the reasoning you gave is good, but a wall of "uh, I'll check with... I mean..." will read as uncertain even when the underlying answer is solid. Say the conclusion first, then justify it.
+
+[STAGE fault-injection]
+HEADING: Fault injection: trigger each failure mode and watch it live
+[P]
+Reading the five causes above is not the same as having actually seen each one happen. You have a real AWS account now — go break each of these on purpose, on a throwaway instance, and watch exactly what `curl` does and how long it takes. This is the fastest way to make the hang-vs-refused distinction from Round 1 permanent instead of theoretical.
+[TABLE]
+Fault | How to trigger it | What curl actually shows
+Security Group blocking | `aws ec2 revoke-security-group-ingress --group-id <sg-id> --protocol tcp --port 80 --cidr 0.0.0.0/0` — removes the rule you added earlier | Hangs, no response at all (silent drop)
+No public IP | Launch a fresh instance in a subnet with auto-assign-public-IP disabled, and don't pass `--associate-public-ip-address` | `describe-instances` shows no `PublicIpAddress` — there's nothing to even curl against
+Network ACL deny | `aws ec2 create-network-acl-entry --network-acl-id <acl-id> --rule-number 50 --protocol tcp --port-range From=80,To=80 --cidr-block 0.0.0.0/0 --egress false --rule-action deny` on the instance's subnet NACL | Hangs, no response — same symptom as a Security Group block, which is exactly why it's easy to misdiagnose
+User-data/app not running | SSH or SSM in, run `sudo systemctl stop nginx` | Connection refused, comes back almost instantly
+OS-level firewall | SSH/SSM in, `sudo systemctl start firewalld` without opening port 80 | **Confirmed by real test (2026-10-24): hangs, ~21s timeout** — on Amazon Linux, firewalld's default zone drops unlisted traffic silently rather than rejecting it, so don't assume REJECT-style behavior by default; it depends on the configured target (DROP vs REJECT), and here it was DROP
+[NOTE]
+Revert each fault before moving to the next one (re-add the SG rule, delete the NACL deny entry, restart nginx) so you're only ever testing one variable at a time. Don't leave the Security Group or NACL open wider than you need once you're done, and terminate the throwaway instance when you're finished so it doesn't sit there costing money.
+
+[ROUND ec2_r2]
+QUESTION: Go trigger at least 3 of the 5 faults from the fault-injection table above on a real instance (your choice which three). For each one, report exactly what curl showed, roughly how long it took to respond, and whether it matched the hang-vs-refused prediction from Round 1's review.
+DOUBTS: curl error 28: Connection timed out (network layer)
+curl error 7: Connection refused (app layer)
+i need to learn other curl error codes as well for devops and their reasons.
+ANSWER: 1. sg revoked: curl: (28) Failed to connect to 54.197.151.31:80 after 21038 ms: Could not connect to server (hanged)
+2. nginx stoped: curl: (7) Failed to connect to 54.197.151.31:80 after 4162 ms: Could not connect to server (refused)
+3. firewalld: curl: (28) Failed to connect to 54.197.151.31:80 after 21045 ms: Could not connect to server (hanged)
+network errors(conn timedout) are taking more time to show while app errors(conn refused) are showing less time.
+SAVEDAT: 2026-10-24T13:25:15.111Z
+REVIEWED: true
+VERDICT: correct
+ASSESSMENT: Correct, and genuinely well done — this is exactly what this round was for. All 3 tests ran clean, you read the curl exit codes correctly (28 = timeout/network layer, 7 = refused/app layer), you reported real timings, and your own synthesized rule ("network errors take longer to show, app errors show fast") is precisely the hang-vs-refused mechanism from Round 1's review, now verified with your own eyes instead of taken on faith. The SG and nginx-stop results matched the prediction exactly. The firewalld result did NOT match what the lesson said ("usually refused") — and that's not a mistake on your part, it's a gap in what I wrote. Your real test is better evidence than my prediction, so I've corrected the module's fault-injection table to reflect what actually happened: on Amazon Linux, firewalld's default zone apparently drops silently (DROP-style) rather than rejecting (REJECT-style), which is why you got a ~21s hang instead of an instant refusal. Good catch, even though you weren't looking for it — that's the value of actually running the experiment instead of just reading about it.
+CLARIFICATION: **Why SG and firewalld both hang at ~21s, almost identically:** both are cases where the TCP SYN packet is silently dropped — the client sends SYN, gets no SYN-ACK and no RST, and just keeps retrying until *your client's own OS* gives up. This is not an AWS or curl-specific number, and it's not a universal OS/kernel constant either — it's determined entirely by your client machine's TCP stack settings (retry count x backoff), which is why it was identical for both tests: same client, same settings, both silently dropped. You're on Windows, and Windows' default (initial SYN + 2 retries, backing off ~3s/6s/12s) lands right around ~21s before giving up — a Linux client defaults to more retries with longer backoff (`net.ipv4.tcp_syn_retries`, default 6) and would typically take 60s+ to give up on the exact same silent drop. **Why nginx-stop was fast (~4s, refused):** once the Security Group lets the SYN through, the OS has to actually respond — and if nothing is listening on port 80, the kernel immediately sends back a TCP RST ("nobody's home"), which curl reports as exit code 7, connection refused. No retries needed, so it's fast.
+
+**More curl exit codes worth knowing for DevOps work:**
+- `0` — success.
+- `6` — couldn't resolve host: DNS failure (wrong hostname, DNS server down, or a typo in the URL).
+- `7` — failed to connect / connection refused: TCP reached the host, nothing's listening on that port (what you saw with nginx stopped).
+- `28` — operation timeout: no response at all within curl's timeout window (what you saw with SG and firewalld) — the generic "something upstream is silently eating my packets" code.
+- `35` — SSL connect error: TLS handshake failed (protocol mismatch, cert issue during negotiation) — common when you curl `https://` against a plain HTTP-only server.
+- `52` — empty reply from server: the TCP connection succeeded and then closed with zero bytes sent back — classic symptom of a misconfigured reverse proxy/load balancer forwarding to a dead backend.
+- `56` — failure receiving network data: connection was reset *mid-transfer*, not at connect time — different from 7, which fails immediately.
+- `60` — SSL certificate problem: usually a self-signed or untrusted CA cert.
+
+As a troubleshooting habit: codes `6`/`7`/`28` tell you which *layer* failed (DNS, app/port, or network-path) before you even look at logs — that's worth internalizing, it's the same "narrow down the layer first" discipline as Round 1.
+
+[STAGE conclusion]
+HEADING: What EC2 alone can't do
+[P]
+You can now launch a reachable instance, read its own metadata through the Security Group, and tell the difference between a silently-dropped request and a flatly-refused one — by instinct, not guesswork, since you've actually watched both happen. But a single hand-launched instance is also a single point of failure, and nothing here reacts if traffic grows or an instance dies.
+[P]
+That's exactly the gap the next page closes: an Auto Scaling Group keeps a fleet of these instances alive and sized correctly on its own, and a load balancer gives them one stable address to be reached through. EC2 is the unit; ASG and the load balancer are what turn it into something you'd actually run in production.
