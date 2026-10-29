@@ -1,0 +1,405 @@
+MODULE: terraform-2
+TITLE: Terraform — Part 2: Variables & count/for_each
+COVERED: 2026-10-29
+
+[STAGE knowledge]
+HEADING: The same stack, with every hardcoded value given exactly one home
+[P]
+Part 1 built a real EC2 → ASG → ALB → VPC stack with every value typed directly into the resource blocks — and that honesty is exactly what made two real problems visible instead of theoretical: the AMI id sitting in two separate places, and a copy-pasted subnet whose availability zone was silently left pointing at the wrong one. Both were "you'd only notice if you went looking for it" bugs. Part 2 fixes the actual structural cause, not just those two spots — every value that could ever be typed more than once gets pulled out into a `variable`, declared exactly once, referenced everywhere it's needed. The subnet/route-table-association pattern you had to repeat by hand in Part 1 (and again building your own "tuf1" VPC) also gets rebuilt here using `count`, so adding a third subnet is a one-line change instead of three new resource blocks.
+
+[STAGE pieces]
+HEADING: variable, var.name, terraform.tfvars, locals, count, for_each
+[DIAGRAM nodes="variables.tf (declares)|terraform.tfvars (supplies values)|main.tf (var.x references)|terraform plan|terraform apply" highlight="variables.tf (declares)|terraform.tfvars (supplies values)"]
+[DEFS]
+variable block :: declares an input - a name, a type, optionally a description and a default. `variable "instance_type" { type = string, default = "t3.micro" }` - this is a declaration, not a value assignment by itself.
+var.name :: how a resource block reads a declared variable's actual value - `instance_type = var.instance_type`. Exactly one place in the whole config ever defines what that value actually is.
+terraform.tfvars :: a file Terraform auto-loads with no flag needed, purely because of its exact filename, to supply/override variable values - `instance_type = "t3.micro"` here overrides that variable's own default. A differently-named file needs `-var-file=something.tfvars` explicitly.
+locals block :: a named expression computed once and reused, NOT an input like a variable - `locals { common_tags = { Project = var.project_name } }`. Use a variable for something someone else should be able to override from outside; use a local for something derived purely from values already inside the config.
+count :: a meta-argument that creates N copies of a resource, addressed by position - `aws_subnet.public[0]`, `aws_subnet.public[1]`. `count.index` inside the block is that position, usable to index into a parallel list like `var.public_subnet_cidrs[count.index]`.
+for_each :: the same idea, but addressed by a stable key instead of a position - over a map (`each.key`/`each.value`) or a set of strings (`each.key` == `each.value`). `aws_subnet.public["a"]`, `aws_subnet.public["b"]`.
+splat expression :: `aws_subnet.public[*].id` - "every `.id` from this count-based resource," a compact way to turn a list of resource objects into a list of just one of their attributes. Needed constantly once subnets exist via `count`, since `aws_lb.subnets`/`aws_autoscaling_group.vpc_zone_identifier` both want a plain list of ids.
+
+[STAGE hands-on]
+HEADING: A fresh stack ("tf2"), fully variable-driven, subnets via count
+[P]
+A brand new, independent stack - its own working directory, its own resource addresses, nothing shared with tf1 or your own tuf1. Same build order as Part 1 (VPC/subnets first this time, then the compute layer, then the ALB), three checkpoints.
+[CODE lang=hcl caption="variables.tf - every value that was hardcoded in Part 1, now declared once"]
+variable "region" {
+  description = "AWS region to deploy into"
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "project_name" {
+  description = "Short name used as a prefix for every resource in this stack"
+  type        = string
+  default     = "tf2"
+}
+
+variable "ami_id" {
+  description = "AMI id for the EC2 instances - referenced once now, not duplicated like Part 1"
+  type        = string
+  default     = "ami-0abcd1234efgh5678"
+}
+
+variable "instance_type" {
+  type    = string
+  default = "t3.micro"
+}
+
+variable "allowed_ssh_cidr" {
+  description = "Your own real public IP as a /32 - no placeholder, same rule as Part 1"
+  type        = string
+  default     = "203.0.113.5/32"
+}
+
+variable "key_name" {
+  type    = string
+  default = "your-keypair-name"
+}
+
+variable "vpc_cidr" {
+  type    = string
+  default = "10.4.0.0/16"
+}
+
+variable "public_subnet_cidrs" {
+  description = "One CIDR per public subnet - must stay the same length as public_subnet_azs"
+  type        = list(string)
+  default     = ["10.4.1.0/24", "10.4.2.0/24"]
+}
+
+variable "public_subnet_azs" {
+  description = "One AZ per public subnet, same order as public_subnet_cidrs - count.index pairs them up"
+  type        = list(string)
+  default     = ["us-east-1a", "us-east-1b"]
+}
+
+variable "asg_min_size" {
+  type    = number
+  default = 2
+}
+
+variable "asg_max_size" {
+  type    = number
+  default = 4
+}
+[CODE lang=hcl caption="terraform.tfvars - auto-loaded by filename alone, overrides any default above"]
+# terraform apply reads this automatically - no -var-file flag needed,
+# purely because this exact filename is special-cased by Terraform.
+project_name     = "tf2"
+instance_type    = "t3.micro"
+allowed_ssh_cidr = "203.0.113.5/32"   # replace with YOUR real public IP before applying
+key_name         = "your-keypair-name"
+[CODE lang=hcl caption="main.tf part 1 - provider, VPC, subnets via count"]
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.region                 # hardcoded in Part 1 - now a variable, overridable at apply time
+}
+
+locals {
+  common_tags = {
+    Project = var.project_name        # computed once from a variable, not itself an input
+  }
+}
+
+resource "aws_vpc" "main" {
+  cidr_block = var.vpc_cidr
+  tags       = merge(local.common_tags, { Name = "${var.project_name}-vpc" })
+}
+
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+  tags   = merge(local.common_tags, { Name = "${var.project_name}-igw" })
+}
+
+resource "aws_subnet" "public" {
+  count                   = length(var.public_subnet_cidrs)   # 2 today - add a 3rd CIDR+AZ pair later, nothing else changes
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = var.public_subnet_cidrs[count.index]
+  availability_zone       = var.public_subnet_azs[count.index]   # paired by position - this is exactly what the troubleshoot below breaks
+  map_public_ip_on_launch = true
+  tags = merge(local.common_tags, { Name = "${var.project_name}-public-${count.index}" })
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+}
+
+resource "aws_route_table_association" "public" {
+  count          = length(aws_subnet.public)      # the exact fix for Part 1 Round 1's question - one line per subnet, automatically
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+[CODE lang=bash caption="CHECK 1 - plan, apply, confirm both subnets landed in the AZs you actually intended"]
+terraform plan
+terraform apply
+aws ec2 describe-subnets --filters "Name=vpc-id,Values=$(terraform output -raw 2>/dev/null)" \
+  --query 'Subnets[*].[SubnetId,CidrBlock,AvailabilityZone]' --output table
+# or just: aws ec2 describe-subnets --filters Name=tag:Project,Values=tf2 --query 'Subnets[*].[CidrBlock,AvailabilityZone]' --output table
+[CODE lang=hcl caption="main.tf part 2 - security group, launch template, ASG - ami_id referenced exactly once"]
+resource "aws_security_group" "web" {
+  name   = "${var.project_name}-web-sg"
+  vpc_id = aws_vpc.main.id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.allowed_ssh_cidr]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  tags = local.common_tags
+}
+
+resource "aws_launch_template" "web" {
+  name_prefix   = "${var.project_name}-web-"
+  image_id      = var.ami_id          # ONE reference - the Part 1 duplication bug is structurally impossible now
+  instance_type = var.instance_type
+  key_name      = var.key_name
+  vpc_security_group_ids = [aws_security_group.web.id]
+  user_data = base64encode(<<-EOF
+    #!/bin/bash
+    dnf install -y nginx
+    systemctl enable --now nginx
+  EOF
+  )
+}
+
+resource "aws_autoscaling_group" "web" {
+  name                = "${var.project_name}-asg"
+  min_size            = var.asg_min_size
+  desired_capacity    = var.asg_min_size
+  max_size            = var.asg_max_size
+  vpc_zone_identifier = aws_subnet.public[*].id    # splat - every subnet id, however many count created
+  health_check_type   = "EC2"
+
+  launch_template {
+    id      = aws_launch_template.web.id
+    version = "$Latest"
+  }
+  tag {
+    key                 = "Name"
+    value               = "${var.project_name}-asg-instance"
+    propagate_at_launch = true
+  }
+}
+[CODE lang=bash caption="CHECK 2 - plan, apply, confirm instances landed across BOTH subnets"]
+terraform plan
+terraform apply
+aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names tf2-asg \
+  --query 'AutoScalingGroups[0].Instances[*].[InstanceId,AvailabilityZone,LifecycleState]' --output table
+[CODE lang=hcl caption="main.tf part 3 - target group, ALB, listener"]
+resource "aws_lb_target_group" "web" {
+  name_prefix = "tf2tg-"              # same 6-char cap as Part 1 - region/account-scoped naming
+  port        = 80
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.main.id
+
+  lifecycle {
+    create_before_destroy = true      # same fix as Part 1 - cheap insurance even on a brand-new resource
+  }
+
+  health_check {
+    path                = "/"
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+    interval            = 15
+  }
+}
+
+resource "aws_autoscaling_attachment" "web" {
+  autoscaling_group_name = aws_autoscaling_group.web.name
+  lb_target_group_arn    = aws_lb_target_group.web.arn
+}
+
+resource "aws_lb" "web" {
+  name               = "${var.project_name}-alb"
+  internal           = false
+  load_balancer_type = "application"
+  subnets            = aws_subnet.public[*].id
+  security_groups    = [aws_security_group.web.id]
+  tags               = local.common_tags
+}
+
+resource "aws_lb_listener" "web" {
+  load_balancer_arn = aws_lb.web.arn
+  port              = 80
+  protocol          = "HTTP"
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.web.arn
+  }
+}
+
+output "alb_dns_name" { value = aws_lb.web.dns_name }
+[CODE lang=bash caption="CHECK 3 - plan, apply, curl it"]
+terraform plan
+terraform apply
+curl http://$(terraform output -raw alb_dns_name)
+
+[STAGE troubleshoot]
+HEADING: Reordering a list that didn't conceptually change anything
+[P]
+Nothing about the stack needs to change - still exactly 2 public subnets, same 2 CIDRs, same 2 AZs. But you decide `us-east-1b` should be listed first for readability, and swap the order in both lists at once, keeping each CIDR correctly paired with its AZ:
+[CODE lang=hcl caption="the only edit made - both lists reordered together, pairing preserved"]
+variable "public_subnet_cidrs" {
+  default = ["10.4.2.0/24", "10.4.1.0/24"]      # was ["10.4.1.0/24", "10.4.2.0/24"]
+}
+variable "public_subnet_azs" {
+  default = ["us-east-1b", "us-east-1a"]        # was ["us-east-1a", "us-east-1b"]
+}
+[CODE lang=bash caption="terraform plan - NOT a no-op"]
+terraform plan
+# aws_subnet.public[0] will be updated in-place... no, actually:
+#   ~ availability_zone = "us-east-1a" -> "us-east-1b" # forces replacement
+#   -/+ resource "aws_subnet" "public" {
+# aws_subnet.public[1] shows the mirror image
+# Plan: 2 to add, 0 to change, 2 to destroy
+[P]
+`count.index` is just position in a list - `aws_subnet.public[0]` means "whatever is at index 0 right now," not "the specific subnet I originally called public_a." Reordering the list changes what's AT position 0, and from Terraform's point of view that's indistinguishable from actually changing the first subnet's AZ - the exact same `-/+ replace` as if you'd genuinely edited it by hand. If this ASG already had running instances, that replacement destroys and recreates both subnets - taking every instance's network interface with them.
+
+[STAGE key-insight]
+HEADING: count ties identity to position; for_each ties it to a name
+[NOTE]
+This is the structural reason `for_each` exists, not just a style preference. A `count`-based resource's identity IS its position - there's no way to tell Terraform "this is still conceptually the same subnet, I just reordered my source list." A `for_each`-based resource's identity is its KEY, and map keys have no inherent order at all - reordering a map's entries is a complete no-op, because there's no "position" for the reorder to even apply to.
+[CODE lang=hcl caption="the same two subnets, rewritten with for_each and a map keyed by name instead of position"]
+variable "public_subnets" {
+  description = "Keyed by a stable name, not list position - reordering this map can never trigger a replacement"
+  type = map(object({
+    cidr_block        = string
+    availability_zone = string
+  }))
+  default = {
+    a = { cidr_block = "10.4.1.0/24", availability_zone = "us-east-1a" }
+    b = { cidr_block = "10.4.2.0/24", availability_zone = "us-east-1b" }
+  }
+}
+
+resource "aws_subnet" "public" {
+  for_each                = var.public_subnets
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = each.value.cidr_block
+  availability_zone       = each.value.availability_zone
+  map_public_ip_on_launch = true
+  tags = { Name = "${var.project_name}-public-${each.key}" }    # aws_subnet.public["a"], aws_subnet.public["b"]
+}
+
+resource "aws_route_table_association" "public" {
+  for_each       = aws_subnet.public
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.public.id
+}
+[NOTE]
+The trade-off: `aws_subnet.public[*].id` (splat, works on count) has no direct equivalent on a for_each map - you need `[for s in aws_subnet.public : s.id]` or `values(aws_subnet.public)[*].id` instead, slightly more to type for the same result. `count` also wins when you genuinely just want "N identical-ish copies" and don't care about individually addressing or naming each one. `for_each` wins the moment any single item in the set might need to be added, removed, or reordered independently without disturbing its neighbors - which, in practice, is most real infrastructure.
+
+[STAGE key-insight]
+HEADING: The actual tool for migrating count to for_each: moved blocks
+[P]
+Everything in the troubleshoot section above assumed switching a resource from count to list-reordering (or from count to for_each entirely) always means destroy-and-recreate. It doesn't have to. aws_subnet.public[0] and aws_subnet.public["a"] are different ADDRESSES to Terraform, but if the underlying resource's actual arguments (cidr_block, availability_zone) are identical either way, the real AWS subnet never needed to be touched at all - only Terraform's own bookkeeping of "which address does this real resource live at" needed to change. A moved block tells Terraform exactly that.
+[CODE lang=hcl caption="moved blocks - count indices to for_each keys, same real resources, zero AWS changes"]
+moved {
+  from = aws_subnet.public[0]
+  to   = aws_subnet.public["a"]
+}
+moved {
+  from = aws_subnet.public[1]
+  to   = aws_subnet.public["b"]
+}
+
+moved {
+  from = aws_route_table_association.public[0]
+  to   = aws_route_table_association.public["a"]
+}
+moved {
+  from = aws_route_table_association.public[1]
+  to   = aws_route_table_association.public["b"]
+}
+[P]
+Add these alongside switching the resource's count to for_each (same apply, same config), then plan. If the subnet's own arguments haven't otherwise changed, the plan shows no destroy and no create for these resources at all - just a quiet address rename, confirmed in the plan output as "resource address changed" rather than any create/destroy symbols. The ASG and ALB downstream never see a gap, because the actual subnet ids never changed - only what Terraform calls them internally did.
+[NOTE]
+This is the direct, concrete answer to "what was I missing": the whole multi-step migration in this page's troubleshoot and Round 1 - new temporary CIDRs, -target, -replace, re-pointing the ASG and ALB, destroying the old subnets - was all necessary ONLY because the subnets were allowed to actually get destroyed and recreated as part of the count-to-for_each switch. A moved block sidesteps that entire category of problem for a pure address change. It does NOT help when a resource's actual arguments are genuinely changing too (a real new CIDR, a real new AZ) - that's still a real replacement, and everything from Part 1's fault-injection table still applies in full. The rule going forward: before changing count to for_each (or reordering a list, or renaming a resource block), ask "is this resource's real-world content actually changing, or just its Terraform address?" If it's purely an address change, write the moved block first and the destroy/recreate drama simply doesn't happen.
+
+[STAGE key-insight]
+HEADING: Working checklist, built from every real incident across both pages
+[NUMBERED]
+Read the plan's action symbol, not just the resource name, before every apply - ~ is in-place and safe by itself; -/+ is a replace, and means stop and ask "is the old one still attached to anything live?" before applying.
+Predict ForceNew before you change a ForceNew-looking attribute, since it can't be read directly from your own code - a resource's vpc_id, a subnet's availability_zone, and a resource's own address (count to for_each) are the recurring culprits. When unsure, run plan only, read the symbol, decide the next move from that.
+Make one structural or identity-changing edit per apply, not several stacked together - reordering a list, switching count to for_each, and using -replace on downstream resources all at once is exactly what turns a manageable change into a loop.
+Reach for a moved block first when a resource's real-world content isn't actually changing, only its address - renaming, reorganizing into for_each, restructuring modules - before accepting a destroy and recreate as inevitable.
+When a real replacement is unavoidable and something else depends on the old resource, sequence it yourself - -target the dependent resource first, confirm it detached, then let the old one destroy. Don't trust one big apply to order it correctly on its own.
+Verify empirically, not just via terraform plan - plan only reflects what Terraform's graph can see. Check AWS directly with describe-network-interfaces, describe-auto-scaling-groups, or describe-target-health when something is genuinely ambiguous.
+Let slow operations finish - an ALB taking 2 to 4 minutes to create is normal, not a hang. Interrupting mid-create is one of the most common real causes of a tainted resource.
+Run a plain terraform plan again after every apply before moving on - "No changes. Your infrastructure matches the configuration." is the actual signal you're safe to continue, not just apply exiting without an error.
+
+[ROUND terraform2_r1]
+QUESTION: In the troubleshoot above, swapping the two entries in public_subnet_cidrs and public_subnet_azs together (keeping each CIDR correctly paired with its AZ) still caused terraform plan to show aws_subnet.public[0] and aws_subnet.public[1] both as -/+ replace. Explain precisely why count causes this even though neither subnet's actual intended CIDR/AZ pairing changed. Then: if this stack already had an ASG with 2 running instances when you applied that reordered plan, what actually happens to those instances - do they just get relabeled, or does something real get destroyed? Finally, using the for_each rewrite in the key-insight above as your reference: if someone later deletes the "a" key from var.public_subnets entirely (leaving only "b"), what does for_each do differently here than count would have in the same situation?
+DOUBTS:
+ANSWER: Okay I try to swap the two entries in public_subnet_cidrs variable so I change it from the 0 cidr value to the 1 cidr value and I just replaced it and I ran the terraform plan so the terraform plan said like it is going to delete resources and it is going to create some resources where ASG is also a part of it. But when I try to apply it I got this error like a data dependency error so the thing is like it was unable to delete the already aligned one with respect to the already attached resources. So answer to your question is like even without changing the CIDR and AZ pairing, but still it was started to destroy or replace is due to the index - the main reason here is the index that we have mentioned using the count method, so the count method deliberately puts the values based on the index so when the index changed, terraform does not know and it will think that a new pair of indexes has been introduced and this index has a different pair of sets, so that was happened. Even I tried to use a lifecycle policy like create_before_destroy set to true but still it was unable to destroy them because of the same data dependency. Next, for the for_each question, I tried with for_each as well, I tried to do it but still it is also unable to create new ones - the reason is I got one data dependency error and the second one is CIDR address conflict, so I am unable to do it, so to test if a key was deleted I don't know that situation yet.
+SAVEDAT: 2026-10-29T15:06:52.602Z
+REVIEWED: true
+VERDICT: partial
+ASSESSMENT: Real credit on Part 1 - you correctly identified that count assigns identity by position/index, and that Terraform can't distinguish "the pairing didn't conceptually change" from "a genuinely new pair was introduced" - that's the actual mechanism, stated correctly even if loosely phrased. Part 2 and 3 are where this gets genuinely interesting: instead of just reasoning about what WOULD happen, you actually tried both changes live on your real stack and hit two real failures - that's better evidence than a hypothetical answer, but it means neither question got a direct explanation, just an incident report. Checked your actual terraform.tfstate just now: aws_subnet.public is still addressed as [0]/[1] (count-style) in state right now, even though main.tf already declares for_each - confirming the for_each migration genuinely never completed, exactly matching what you described. Part 3 (for_each + key deletion) you correctly flagged as untested/unknown rather than guessing - honest, but still needs an answer, given below.
+CLARIFICATION: Full answer for the record, tying together what actually happened. Part 2 - what really happens: count reordering plans aws_subnet.public[0] and [1] as -/+ replace, same as the troubleshoot section showed. But these subnets already have a live ASG and ALB attached (via vpc_zone_identifier and subnets, both referencing these exact subnet ids) - so when Terraform tries the destroy half of that replace, AWS rejects it with a DependencyViolation: a subnet can't be deleted while it still has active ENIs in it (the ASG instances' network interfaces, the ALB's own ENIs) - this is the EXACT SAME failure class as Part 1's security-group/ALB incidents, just one layer up the stack (a subnet instead of a security group). create_before_destroy didn't help here for a structural reason: it only reorders DESTROY-then-CREATE into CREATE-then-DESTROY for a single resource being replaced - it doesn't detach the ASG/ALB from the old subnet first, so the old subnet is still just as "in use" when its destroy is attempted, create_before_destroy or not. The actual fix is the same two-step pattern from Part 1's fault-injection table: get the ASG/ALB pointed at new subnets FIRST (a separate, deliberate step), confirm they've actually moved, THEN destroy the old subnets once nothing's attached - never let one single apply try to do both at once. Switching from count to for_each compounds this further: aws_subnet.public[0] and aws_subnet.public["a"] are completely different resource addresses to Terraform, even if you intend them as "the same subnet" - so the migration isn't an in-place update at all, it's destroy count-addressed subnets + create for_each-addressed subnets as entirely separate resources. If the create half runs before the stuck destroy half finishes (or the destroy never finishes because of the DependencyViolation above), the new subnets can end up needing the same CIDR block that the old, still-undeleted subnets already occupy in that VPC - which AWS rejects outright, matching the "CIDR address conflict" you hit. Part 3 - what for_each does differently when a key is deleted: delete the "a" key from var.public_subnets, and Terraform plans to destroy ONLY aws_subnet.public["a"] - "b" is completely untouched, because for_each addresses by key, not position. This is the direct, structural payoff of everything above: with count, ANY reordering touches resources that didn't conceptually change; with for_each, removing one entry only ever touches that one entry, by name, regardless of what else exists in the map or what order it's declared in.
+
+[STAGE fault-injection]
+HEADING: The real tf2 migration incident, compressed
+[P]
+Everything below actually happened, live, on the real tf2 stack - not a staged example. Four compounding failures from one count-to-for_each migration, same table format as Part 1's.
+[TABLE]
+Symptom | Real cause | Fix
+count-reordering the subnet lists plans a clean -/+ replace, but apply hangs with a dependency error | The old subnets still have a live ASG and ALB attached via their ENIs - same DependencyViolation class as Part 1's security-group/ALB incidents, one layer up the stack | Detach the ASG/ALB from the old subnets first (a separate, deliberate apply), confirm, then let the old subnets destroy
+Switching count to for_each for real, with identical CIDR/AZ values to the old subnets, fails with a CIDR address conflict | aws_subnet.public[0] and aws_subnet.public["a"] are entirely different resource addresses - the migration is destroy-old plus create-new, not an in-place rename. The new subnet wants a CIDR the old, still-undeleted one already occupies | Either write moved blocks (zero AWS changes, pure address rename) or, if resources genuinely must be recreated, use temporary non-colliding CIDRs first
+Using terraform apply -replace on the ASG and ALB together to force the migration takes several minutes and looks stuck | ALB creation genuinely takes 2 to 4 minutes - not a hang by itself. But -replace on both resources at once, interrupted or combined with other half-finished changes, left the ASG scaled to 0/0/0 and the ALB fully deleted with nothing recreated | Let slow creates finish without interrupting; prefer -target over -replace when only repointing a resource, not actually recreating it
+Target group shows targets as unused, no health status, after the ALB is gone | AWS doesn't run health checks on a target group until a listener is actually forwarding to it - with the ALB deleted, nothing was | Get the ALB and listener created successfully first - target health only resolves once real traffic routing exists
+[NOTE]
+The fastest way out of all four, confirmed working: get one full, authoritative terraform plan with nothing targeted, read every line, save it with -out, and apply that single saved plan. Once the ASG and ALB were both already in a broken, non-live state (zero capacity, ALB gone), there was no "something still attached" risk left to protect against - the full plan's own dependency graph correctly sequenced the old subnet destroys after the new resources were created and repointed, in one clean apply.
+
+[ROUND terraform2_r2]
+QUESTION: This page now has two different tools for handling a count-to-for_each migration: moved blocks (shown in the key-insight above) and the "temporary non-colliding CIDR, then two-step migrate, then destroy old" approach actually used to fix the real tf2 incident. Explain why moved blocks were NOT a usable fix for tf2's actual situation at the point the fix was applied - what had already happened to the old subnets that ruled it out. Then: looking at the fault-injection table above, the third row describes -replace on the ASG and ALB leaving the stack in a broken state (ALB deleted, ASG at 0/0/0) - was -replace itself the wrong tool for that step, or was the real problem something else? Make the case either way. Finally, name one thing from the 8-point checklist above that, if followed from the very start of this migration, would have prevented the CIDR conflict from ever happening.
+DOUBTS: 1. what is terraform test
+2. Found the real root cause: aws_alb.web is tainted, so must be replaced. Terraform marks a resource "tainted" when a previous create/update partially failed - meaning an earlier apply errored out mid-way through creating or updating the ALB. Every subsequent apply then tries to replace that tainted ALB from scratch, and if the same underlying problem recurs, it gets tainted again - that's almost certainly your "loop." The listener has never successfully been created because it depends on the ALB's ARN, which keeps failing before it can stabilize. explain
+ANSWER: Analytics 2 to 4 minutes not by hang itself so Ah replace on the source will interrupt both of them and they become half baked changes so that's the what it has changed the statistic scale turn to 0 0 and a year will be deleted fully So instead of replace we need to use Target as a fix Ah based on the checklist I would have just look at the force new Thing a little bit more careful so I would have captured some calculates there So from now on I'll just keep an eye on that first new button And also I'll play everything sequentially one after the other instead of stacking up and Deploying them already all at once
+SAVEDAT: 2026-10-29T16:40:52.538Z
+REVIEWED: true
+VERDICT: partial
+ASSESSMENT: Part 1 of the question (why moved blocks weren't usable for tf2's actual situation) wasn't addressed at all - worth answering directly below, since it's the most important piece. Part 2 (was -replace the wrong tool) - real instinct that -target would have been gentler, and that -replace stacked with other changes produced the half-baked ALB/ASG state - but this misses your own earlier lived data point: you specifically said you used -replace BECAUSE -target was failing with a dependency error once the [0]/[1] references were removed from config. So -target wasn't simply the untried better option - it had already failed for a structural reason, and -replace was reached for as a workaround. The more complete answer needed both halves: why -target failed first, and why -replace then caused its own damage. Part 3 - reasonable: watching ForceNew more carefully and sequencing changes one at a time are genuinely two of the 8 checklist items and would have helped. The single most DIRECTLY on-point item for preventing the CIDR conflict specifically is item 4 (moved blocks) - worth naming explicitly, since it's the one item that removes the conflict's root cause entirely rather than just reducing the chance of making it.
+CLARIFICATION: Full answer for the record. Part 1 - why moved blocks weren't usable at the point the fix was actually applied: moved blocks only relocate a resource's ADDRESS in state - they require the real AWS resource to already exist and be reachable under its old address. By the time the fix was being applied, aws_subnet.public[0] and [1] had problems moved blocks can't solve: the migration had already progressed far enough that state and config had diverged in ways beyond a clean rename (the ASG/ALB were mid-churn, one subnet pair was already created under the NEW for_each addressing with different temporary CIDRs, and the ALB itself had been destroyed entirely by an earlier -replace). moved blocks assume a clean, one-time, pre-planned rename of something otherwise untouched - they are a PREVENTION tool, written before you start a migration, not a RECOVERY tool for a migration that's already partway through multiple failed attempts. Once real destroys and partial applies have already happened, you're past the point moved blocks can help - the honest fix from there is exactly what was actually done: get one full, authoritative plan and apply it as a single reviewed step. Part 2 - both things are true at once, and that's the actual lesson: -target failing first (because config no longer referenced the old [0]/[1] addresses at all, so -target had nothing valid to resolve dependencies against) was the real structural trigger - but -replace was still the wrong tool to reach for next, because -replace unconditionally destroys and recreates the ENTIRE resource, not just the attribute that actually needed to change. The gentler, correct move at that point would have been a plain untargeted terraform plan (no -target, no -replace) to see the full authoritative picture - which is exactly what eventually resolved it. -replace is for forcing a replacement the PROVIDER SCHEMA won't plan on its own (like the ALB subnets case in Part 1) - it is not a general-purpose "my apply is stuck, try something else" tool, and using it that way is what turned one stuck -target into a fully deleted ALB and a zeroed-out ASG.
+DOUBT_ANSWERS: What is terraform test? :: A built-in Terraform command (terraform test) for writing automated tests against your own .tf configuration, using .tftest.hcl files. Each test file defines one or more run blocks - apply a plan (or a real apply) against given variable values, then assert conditions against the result (for example, checking that an output equals an expected value, or that a resource's attribute matches a pattern) - and terraform test reports pass/fail like any other test runner. It can run against real infrastructure or, since Terraform 1.7, a mocked/overridden provider for fast checks with no AWS calls at all. Not used anywhere on this page's hands-on exercises, which have all been manual plan/apply/curl verification - but it's the real, idiomatic way production Terraform codebases catch a regression (like the copy-paste AZ bug, or a ForceNew surprise) automatically, before a human ever runs apply.
+Re-explain the tainted-ALB root cause from the earlier session :: Worth restating cleanly since it's one of the most important mechanics on this page. "Tainted" means Terraform's last attempt to create or update that specific resource did not finish successfully - either AWS itself rejected the call, or the apply was interrupted (Ctrl+C, a closed terminal, a timeout) while that resource's operation was still in flight. Terraform can no longer trust that the resource's real state matches what it tried to do, so it marks it tainted and forces a full destroy-and-recreate on the next apply to get back to a known-good state - this is a SEPARATE mechanism from a normal ForceNew replace (which happens because an attribute changed); a taint happens because a PREVIOUS operation itself failed, regardless of what attributes look like now. In the live incident, the most likely trigger was interrupting an apply during the ALB's normal 2 to 4 minute creation window - that window looks identical to a hang from the terminal, which is exactly what made it feel like a loop. The fix is one of two things: re-apply and let the forced replace run all the way through without interrupting it again (what actually resolved it), or terraform untaint <address> if you've independently confirmed via AWS directly that the resource is actually fine despite the taint flag - never assume that without checking.
+
+[STAGE conclusion]
+HEADING: Variables and count/for_each - and the limits of what plan can protect you from
+[P]
+Part 1 proved that hardcoding duplicates mistakes. Part 2 proved something sharper: even once every value lives in exactly one place, the SHAPE of how you address resources - count's position versus for_each's key - carries its own real risk, and Terraform's plan output only catches the risks its provider schema was written to anticipate. Everything that actually broke on the real tf2 stack - the count reorder, the count-to-for_each CIDR collision, the -replace cascade - came from the same root cause as every incident in Part 1: a gap between what Terraform's dependency graph can see and what AWS actually enforces.
+[BULLETS]
+variable, var.name, and terraform.tfvars took every hardcoded value from Part 1 and gave it exactly one home - the AMI id duplication and the copy-paste AZ bug both become structurally harder to make, not just less likely.
+count correctly builds N copies fast, but ties each one's identity to its position - reordering a list is indistinguishable, to Terraform, from actually changing what's at that position.
+for_each ties identity to a stable key instead, making that specific class of mistake impossible - at the real cost of losing the convenient splat (aws_subnet.public[*].id) and needing a for expression instead.
+moved blocks are the missing piece this page didn't have until a real incident forced it: a pure address-rename, written BEFORE a migration starts, costs nothing and touches no real infrastructure - but once a migration is already partway through, it's too late for moved blocks to help, and the honest recovery is one full, carefully reviewed, authoritative apply.
+[NOTE]
+Part 3 picks up directly from here: modules. Every resource block on this page - the VPC, the subnets, the ASG, the ALB - has been written out in full, by hand, inside one main.tf, for two entirely separate stacks (tf1 in Part 1, tf2 here) that are structurally almost identical. A module is the next, final step in removing duplication: write this entire stack's shape ONCE, as a reusable module, then call it twice with different inputs - no more copy-pasting a whole file's worth of resources to stand up a second, similar stack.
