@@ -218,7 +218,12 @@ resource "aws_route_table_association" "public_b" {
   route_table_id = aws_route_table.public.id
 }
 [NOTE]
-Now update aws_autoscaling_group.web's vpc_zone_identifier and aws_lb.web's subnets to [aws_subnet.public_a.id, aws_subnet.public_b.id] instead of the default-VPC data source, and update the Security Group's vpc_id to aws_vpc.main.id. Then plan/apply once more - this is the same "migrate into a real VPC" step from the VPC page, just expressed as a code change instead of an aws CLI command.
+Now update aws_autoscaling_group.web's vpc_zone_identifier, aws_lb.web's subnets, aws_lb_target_group.web's vpc_id, and the Security Group's vpc_id to point at aws_vpc.main instead of the default VPC - this is the same "migrate into a real VPC" step from the VPC page, just expressed as a code change instead of an aws CLI command. Read the rest of this note before you run plan/apply, because this step is NOT a clean "update in place" the way the rest of this page has been - three different kinds of pain are hiding in it, and `terraform plan` will not warn you about any of them in advance.
+[BULLETS]
+A security group's vpc_id is immutable in AWS - Terraform marks it ForceNew, so this plans as destroy-then-create, by default in that order. Deleting the OLD security group while it's still attached to your live ALB/instances will fail every retry with DependencyViolation and hang indefinitely. Add `lifecycle { create_before_destroy = true }` to aws_security_group.web before you touch vpc_id, so the new one exists (and everything's re-pointed to it) before the old one is destroyed.
+A target group's vpc_id is also ForceNew - same create_before_destroy fix applies. But target group names are unique per region+account (not per-VPC like security groups), so a fixed `name` will collide with itself during the create-before-destroy overlap. Switch to `name_prefix` first.
+An ALB's subnets are NOT marked ForceNew in the provider schema (changing AZs within the same VPC is a legitimate in-place update) - so pointing them at a different VPC's subnets doesn't plan as a replacement at all. Terraform will attempt a quiet in-place update, and AWS will reject it at apply time, not at plan time. The only way to actually move an ALB to a new VPC is to force a real replacement yourself: `terraform apply -replace="aws_lb.web"`.
+Even after all three of those are fixed, your ASG's already-running instances will NOT move to the new VPC just because vpc_zone_identifier changed - EC2 instances can't move between VPCs. They keep running under their original launch template/security group until something replaces them (a deliberate instance refresh, or cycling desired_capacity through 0).
 [CODE lang=bash caption="CHECK 4 - final verification"]
 terraform plan
 terraform apply
@@ -250,9 +255,375 @@ Terraform validates that your HCL is syntactically correct and that resource arg
 [ROUND terraform1_r1]
 QUESTION: In step 4, if you'd used two separate, fully hardcoded aws_route_table_association blocks (one per subnet) instead of the pattern shown, and later needed a third public subnet, what exactly would you have to add or change across the files from this page - list every resource block affected? Then: name one place in this page's hardcoded code (besides the subnet AZ example) where the same literal value appears in more than one spot, and what the real risk is if only one copy ever gets updated.
 DOUBTS:
-ANSWER:
-SAVEDAT:
-REVIEWED: false
-VERDICT:
-ASSESSMENT:
-CLARIFICATION:
+ANSWER: Uh if you need to add a third public subnet then I'll use the VPC ID  Uh next is a new side or block and next a new easy reason  Next is like I'll use  Public IP address assigning public IP address as well  Uh the resources that  Will not block but we can extend those resources like  Autos scaling group we can extend and load balancer we can extend with the new public subnet  Apart from public subnet uh the VPC is the one that I see because every subnet is attached to the PPC  And next the next biggest thing is like the security group so recently I got the errors with the security groups only  Vpc is the one that I need to take  If only one copy ever existed like it will go into distraction mode and it will destroy the things
+SAVEDAT: 2026-10-28T14:38:47.902Z
+REVIEWED: true
+VERDICT: partial
+ASSESSMENT: Real signal, but incomplete on both halves. Part 1: you correctly said the ASG's subnet list and the ALB's subnet list both need extending, and that every subnet links back to the VPC via vpc_id - that's genuine understanding, not guessing. But you never named the actual resource the question was built around: a third, separate aws_route_table_association block. With hardcoded, per-subnet blocks (the premise of the question), there's no way around adding one of those by hand for every new subnet - that manual step is exactly what count/for_each in Part 2 will remove. You also didn't mention needing a new aws_subnet block itself. Part 2 drifts off the actual question - you described today's real security-group ForceNew/destroy incident, which is a correct and valuable lesson on its own, but it isn't what was asked. The question is about a literal value repeated in the hardcoded code (a copy-paste divergence risk), not resource-replacement behavior.
+CLARIFICATION: Full answer for the record. Part 1 - adding a third public subnet in Part 1's fully-hardcoded style touches: (1) a new aws_subnet block (new CIDR, AZ, tags), (2) a new aws_route_table_association block pointing it at the same aws_route_table.public, (3) adding the new subnet's id to aws_autoscaling_group.web's vpc_zone_identifier list, (4) adding it to aws_lb.web's subnets list. Nothing needed on the target group or the route table/IGW themselves - a target group isn't subnet-scoped (same point from the VPC page), and one route table can serve any number of subnet associations. Part 2 - the duplicated literal value is the AMI id (ami-0abcd1234efgh5678), hardcoded once in the commented-out EC2 example and again in the launch template. The real risk: when a new AMI is released, it's easy to update one copy and forget the other, and nothing in terraform plan or apply will ever flag that mismatch - both are just valid, unrelated string literals as far as Terraform's concerned.
+
+[STAGE key-insight]
+HEADING: Round 1's clarification, in plain terms
+[NOTE]
+Adding a third subnet, the hardcoded way: think of each subnet as a parking spot you're painting onto a lot by hand, one at a time. Adding a third spot means painting the new spot itself (a new aws_subnet block), then painting the line connecting that spot to the exit road so cars can actually use it (a new aws_route_table_association - when you're doing this by hand instead of letting a tool draw it automatically, every spot needs its own connecting line). Then you tell the two things that route traffic to spots "you can also use this new one now" - once to the ASG (add it to vpc_zone_identifier), once to the ALB (add it to subnets). You don't need to touch the target group or the route table/gate itself - the target group's more like a phone directory than a parking location (it doesn't care which spot a car's in), and one exit gate can serve any number of spots without needing its own copy per spot.
+[NOTE]
+The duplicated AMI id: it's like writing someone's phone number by hand on two separate forms instead of saving it once in a shared contacts list. If that person's number changes, you have to remember to update both forms - and if you only update one, nothing tells you the two forms now disagree. Same thing here: the AMI id is typed out twice (once in the old single-instance example, once in the launch template). If AWS releases a newer, patched image and you update one copy but forget the other, nothing warns you - Terraform just sees two separate, individually valid pieces of text. It has no idea they were ever supposed to match.
+
+[STAGE fault-injection]
+HEADING: Five ways "just change the VPC" actually broke, live, today
+[P]
+Not hypothetical this time - this is exactly what happened migrating this page's stack from the default VPC to aws_vpc.main. Five distinct failures, each teaching a different limit of what Terraform actually checks for you versus what only AWS's own API enforces at apply time.
+[TABLE]
+Symptom | Real cause | Fix
+`terraform apply` hangs for 10+ minutes on "Still destroying..." for a security group | The SG was removed from config entirely (not replaced - destroyed outright). Terraform updated an unrelated resource (the ALB) and tried to destroy the orphaned SG in the same apply, without confirming the ALB had actually detached from it first | Split into two applies: `-target` the resource still using the SG first, confirm it switched, then a plain apply for the destroy
+A security group's vpc_id change plans as `-/+ replace`, and the destroy half hangs the same way | `vpc_id` is ForceNew on aws_security_group - Terraform's default replacement order is destroy-then-create | Add `lifecycle { create_before_destroy = true }` so the new SG exists (and everything's re-pointed to it) before the old one is destroyed
+Target group replacement fails with a duplicate-name error even with create_before_destroy added | Target group names are unique per region+account - not per-VPC like security groups. A fixed name collides with itself during the brief create-before-destroy overlap | Use `name_prefix` instead of `name` (capped at 6 characters specifically for aws_lb_target_group - tighter than most other AWS resources)
+ALB's subnets change shows as a harmless `~ update in-place` in `terraform plan`, then AWS rejects it at `apply` | `subnets` is NOT marked ForceNew in the provider schema (it's meant for adding/removing AZs within the same VPC, a legitimate in-place op) - moving to a different VPC entirely isn't something the schema anticipates | Force a real replacement yourself: `terraform apply -replace="aws_lb.web"`
+Deposed old SG still won't destroy even after the ALB is fixed | The ASG's already-running instances were launched under the OLD launch template version and kept their original ENIs/security group - changing the launch template's SG reference doesn't retroactively touch instances that already exist | Cycle the ASG through zero: set min_size/desired_capacity to 0, apply, then back to the real values, apply - forces fresh instances on the current launch template
+[CODE lang=bash caption="the two-step fix for a destroy stuck behind a live attachment (faults 1 and 2)"]
+terraform apply -target="aws_lb.web"      # update the thing still using the old resource first
+terraform plan                             # confirm only the now-truly-orphaned resource is left
+terraform apply                            # the destroy succeeds in seconds once nothing references it
+[CODE lang=bash caption="forcing a replacement the provider schema won't plan on its own (fault 4)"]
+terraform apply -replace="aws_lb.web"
+# -replace is a CLI flag, not something you can write into the resource block -
+# ForceNew is the provider author's choice per attribute, not yours to set from HCL
+[CODE lang=bash caption="cycling an ASG through zero to force-retire stale instances (fault 5)"]
+# 1. edit main.tf: min_size = 0, desired_capacity = 0
+terraform apply
+# 2. edit main.tf back: min_size = 2, desired_capacity = 2
+terraform apply
+# every instance is now on the current launch template - nothing left pinning the old SG
+[NOTE]
+The common thread across faults 2-4: `terraform plan` only knows what the provider's schema tells it to check. A security group's vpc_id is correctly marked ForceNew, so plan warns you. An ALB's subnets are deliberately NOT marked ForceNew - because for the overwhelmingly common case (adding an AZ within the same VPC) that's a legitimate, safe in-place update, and marking it ForceNew would force a full ALB rebuild on every ordinary AZ change for every other user of that resource. The schema is right for the common case and silently wrong for yours. Plan passing is not proof AWS will accept the change - it's proof Terraform's local type-checking passed.
+
+[ROUND terraform1_r2]
+QUESTION: Of today's five faults, the ALB subnets one is the strangest: `terraform plan` showed it as a harmless in-place update, not a replacement - while the security group's vpc_id change, under the exact same "this needs to move to a different VPC" circumstance, got correctly flagged as `-/+ replace`. Explain precisely why the AWS provider's schema treats these two attributes differently. Then, playing provider-author for a second: if you changed aws_lb's schema to mark `subnets` as ForceNew so plan would catch this, what common, completely legitimate workflow would you break for every other aws_lb user? Separately: fault 1's destroy-before-detach hang got fixed with two separate applies (-target first, then a plain apply) - a single combined apply didn't sequence it correctly on its own. What does that tell you about how far you can trust Terraform's dependency graph to order a destroy correctly for a resource that's been deleted from config entirely, versus one still present and referenced?
+DOUBTS:
+ANSWER: Alb subnets or the strange ones here so when I did apply Terraform plan it just showed me as an update not a replacement  Uh the reason is like because that is commonly used in AWS as a legitimate thing  Being the reason is like whenever an ALB is replaced means Destroyed and recreated a new DNS name will be generated so we cannot  Use separate DNS names because that will divide our core  Purpose on having different IPS on ec2 instances right  So the thing is like to have only one uh standard DNS names the one ALB should be used and the ALB will not change definitely for every aged attachments it will only change when there is a change in subnets or when there is change in VPC  So whether the subnet is a public subnet or private subnet or it is a new VPC  And another VPC only in the case  The ALB need to be generated so we are not in general case not using the force new  Um plan here for  Elb schema  So how far I can  For fault 1 however I can trust terraform dependency graph is  I need to know  Uh where the dependency are happening like I already know like  Security groups are the ones that need to be deleted last and before that there should be all the Detachment should be done and also instantial instance should be detached from is ACG then the ECGs need to be applied then it need to  It needs to be a updated not ACG means I am talking about ASC  Asg  So  I need to cross check where this life cycle is coming up and where force news are coming up  I need to check  The config versus the current one as well
+SAVEDAT: 2026-10-28T15:10:47.308Z
+REVIEWED: true
+VERDICT: partial
+ASSESSMENT: Real credit on part 1's cost argument: ALB replacement generating a brand-new DNS name is exactly right, and it's the single best reason the provider wouldn't want subnets marked ForceNew by default - anyone with that DNS name hardcoded somewhere (a CNAME, a config file, a Route53 alias) would break on every ordinary AZ change if it forced a full rebuild. That's real engineering judgment, not recall - genuinely good. But the explanation of WHY the schema treats vpc_id and subnets differently stayed vague ("commonly used... legitimate thing") rather than landing the actual mechanism: subnets is a single, static schema flag - it has no way to tell "adding an AZ in the same VPC" apart from "moving to a different VPC entirely." The provider author optimized for the common, safe case and accepted that the rare, dangerous case goes uncaught by plan. Part 2 didn't really answer what was asked - you described an operational checklist (detach before delete, check lifecycle/ForceNew) rather than explaining why the graph couldn't be trusted here in the first place.
+CLARIFICATION: Full answer for the record. Part 1 - aws_security_group.vpc_id is ForceNew because a security group's VPC is permanently fixed at creation; there's no legitimate reason to ever change it in place, so marking it ForceNew costs nothing. aws_lb.subnets is NOT ForceNew because changing subnets is a routine, safe, in-place operation in the overwhelming majority of real usage - adding or removing an AZ within the SAME VPC. The schema attribute is one static flag; it can't distinguish "same VPC, different AZ" from "an entirely different VPC" - both just look like "the subnets list changed." If subnets were ForceNew to catch your migration case, every ordinary AZ change for every aws_lb user would force a full destroy-and-recreate, and - as you correctly identified - that means a brand-new DNS name every time, breaking anything depending on the ALB's DNS staying stable. The provider protects the common case and lets the rare, genuinely-impossible-in-place case (moving VPCs) fail loudly at apply instead of being caught at plan. Part 2 - Terraform's dependency graph is built from the resources and references present in the CURRENT config being planned. A resource still present in config (like aws_security_group.web with create_before_destroy) has real edges in that graph, so anything referencing it gets correctly sequenced before it's touched. A resource deleted from config entirely has no such edges to build from - nothing tells the graph "this old thing is still attached to a live ALB/instance in actual AWS." That's the actual boundary: trust Terraform's ordering for resources still present and referenced; don't trust it for a resource you've just removed from config while something else might still be using it in reality - verify directly and split into separate -target applies instead.
+
+[STAGE key-insight]
+HEADING: Round 2's clarification, in plain terms
+[NOTE]
+Why the ALB didn't get a warning but the security group did: think of a security group's VPC like the address printed on your ID card - it's permanently fixed the moment it's made. There's no editing it; you have to get a whole new card issued. Terraform knows this rule, so when you try to change it, it warns you upfront - this needs a brand new one. Now think of an ALB's subnets like which rooms of a house it's plugged into. Normally you just move the plug to a different room in the same house - totally routine, that's "adding an availability zone." Terraform assumes that's always what's happening, because most of the time it is. It has no way to notice "wait, this time you're moving the plug to a completely different house" (a different VPC) - so it tries anyway, and the real wiring (AWS) only refuses the connection at the very last second, during apply. Why didn't they just make subnets strict too? Because then even the everyday harmless case - adding a room in the same house - would force AWS to tear the whole ALB down and rebuild it, and tearing it down means a brand-new DNS name every time, breaking anything that had the old one saved somewhere. So the tradeoff was: keep the common case easy, and let the rare "move to a totally different house" case fail late instead.
+[NOTE]
+Why you can't fully trust the ordering once something's deleted from the file: Terraform draws its whole "do this before that" map by looking only at your current .tf file and asking "what points to what." If a resource is still written in the file and something references it, Terraform sees the arrow clearly and gets the order right. But the second you delete that resource from the file entirely, the arrow disappears too - as far as Terraform's map is concerned, nothing uses it anymore. It doesn't go check real AWS first to ask "is something still actually plugged into this?" So it can try to delete it too early, even though in reality your ALB is still using it. The rule of thumb: trust Terraform's ordering when a resource is still in the file and referenced. Don't trust it the moment you've deleted that resource - check it yourself.
+
+[ROUND terraform1_doubts]
+QUESTION: Open doubts from working through Part 1's hands-on exercises and today's real migration incidents - not a graded question, 29 separate doubts, each answered individually below.
+DOUBTS: 1. why resource "aws_security_group" "web" and resource "aws_instance" "web" are all having web as common word. does it create problem.
+2. note: set aws configure should have 8hrs working window with access keys and secret key and mfa enabled in future learning.
+3. 'terraform apply/destroy with yes' only creates/updates terraform.tfstate file. is it correct?
+4. why terraform.tfstate file "serial": 11, these nos are only odd numbers?
+5. between apply and destroy commands there will terraform.tfstate(n) and terraform.tfstate.backup(n+/-1) infra details right? no older infra details.
+6. if terraform.tfstate is deleted and terraform.tfstate.backup only one file does exists has not infra details because of recent destroy function and tf files are gone. what will scenario?
+7. what does protocol -1 represent?
+8. my observation. i did not put ami value inside tf file and ran fmt,validate, plan they did not show the error. only apply showed the error like ImageID is required. where and when will i catch this kind of errors in terraform.
+9. Creation complete after 16s [id=i-035b39810f3ef659d] does it mean, web application is started to serve? and how will i know it
+10. curl cmd did not work so i debug and found user data script failed and i manually edited inside ec2 by ssh into it. is there other way to find and fix
+11. terraform output command confusion - you did not teach about terraform output command. what is it and how to use and where the outputs are saved in a file.
+12. terraform output cmd did not work. Warning: No outputs found error.
+13. Note: You didn't use the -out option to save this plan, so Terraform can't guarantee to take exactly these actions if you run "terraform apply" now. what is the meaning of it.
+14. for vpc_zone_identifier = [data.aws_subnets.default.ids[0],data.aws_subnets.default.ids[1]], i got Availability Zones use1-az2 (us-east-1b) use1-az5 (us-east-1f). why not 1a,1b az's
+15. i changed user-data in launch template and it became version 2. when tf apply asg still referred v1 template what to do. i did use version = aws_launch_template.web.latest_version.
+16. launch_template name shows a big generated name like tf1-web-template20261028103430998800000001 - why, and how to control it. even ec2 instances have big names.
+17. i updated version = "$Latest" to version = aws_launch_template.web.latest_version and applied. will new instance automatically refreshed and replaced? i verified they will be replaced automatically.
+17a. why did we not create a security group for alb just like in lesson-1?
+18. if a resource has error when applied and apply cmd failed. will that resource rolled back or partial creation shall be done?
+19. based on tf file order. if previous resource not created will next resource created. is order of resources in tf file important?
+20. why some resource local names are web and some are main. reason please.
+21. why i cannot fill name field for resources like route table and igw. validate cmd gave me errors so i removed it.
+22. why does this get shown when updating asg from one subnet to other vpc subnet: aws_autoscaling_group.web: Still modifying... (several minutes, before a ValidationError)
+23. i interrupted after 8m30s, got Error: execution halted and then the real ValidationError about security groups not linked to the VPC. i changed the security group and reapplied. how much time would it have taken to show the error if i had not halted.
+24. how would i know which service depends on which for deletion. refer question 25 as well.
+25. i tried to replace security group first and apply, next asg and apply, next tg,alb and apply for migration and this got me stuck in the same loop you solved. why did this happen and how to avoid in future.
+26. most things you missed to teach me - sequence, dependency, name_prefix, lifecycle, and why asg needed to be scaled down and up, why alb needed --replace on apply.
+27. Use name_prefix instead of name (capped at 6 characters specifically for aws_lb_target_group - tighter than most other AWS resources). how was it only 6 chars.
+28. Split into two applies: -target the resource still using the SG first, confirm it switched, then a plain apply for the destroy. explain in more detail.
+29. architecture diagram if possible after conclusion.
+ANSWER: No single answer here - this is a batch of 29 real doubts from the hands-on work and today's incidents, each one answered individually below.
+SAVEDAT: 2026-10-28T19:55:00.000Z
+REVIEWED: true
+VERDICT: correct
+ASSESSMENT: All 29 answered individually below. A few are worth flagging specifically: 14 and 22/23 are the same AZ-randomization and ValidationError lessons already taught on the ASG page, now seen live on this one too. 15/17 is the one to read most carefully - it's phrased as already-confirmed ("i verified they will be replaced automatically"), but that claim is worth double-checking against the fault-injection table above rather than taking at face value.
+DOUBT_ANSWERS: Same local name "web" on a security group and an instance - does that cause a problem? :: No problem at all - Terraform always addresses a resource by its full pair, `type.name` together, like a first name plus last name. `aws_security_group.web` and `aws_instance.web` are different "people" because their last names (resource types) differ. The local name only has to be unique among resources of the *same* type - two `aws_security_group` resources both named `web` would genuinely collide, but a security group and an instance sharing the name `web` is completely normal, and is exactly the convention this whole page uses.
+Note: use an 8-hour session window, access key + secret key, MFA enabled, for future learning :: Noted, not a question - and a genuinely good habit. Short-lived, MFA-gated credentials (`aws sts get-session-token --duration-seconds 28800`, or an SSO session) are exactly what real teams require, instead of long-lived static keys sitting in a config file forever. Worth building into whichever topic covers IAM properly.
+Does apply/destroy only create or update terraform.tfstate? :: Yes, mechanically correct. Every apply or destroy rewrites `terraform.tfstate` to reflect the new truth, and keeps exactly one prior copy as `terraform.tfstate.backup` (the state as it was immediately before that operation). It's a two-generation system, not a running history.
+Is the "serial" number in terraform.tfstate always odd? :: No, that's coincidence - checked your actual file just now: current serial is 89, backup is 87. `serial` is just a counter incremented every time Terraform writes state - it has no odd/even significance, it's purely "how many times has state been written in this lineage so far."
+Between apply and destroy, is it only current state plus one backup generation, no deeper history? :: Correct, confirmed against your actual files. Locally, Terraform only ever keeps two generations - current and one-back. Real history (every version, forever) only exists with a backend that supports versioning, like an S3 bucket with versioning enabled, or Terraform Cloud's built-in state history.
+If terraform.tfstate is deleted, only an older .backup exists, and the .tf files are gone too - what happens? :: Two problems stacked together. Your `.backup` reflects state from *before* the destroy - if the real infrastructure is actually gone, restoring it makes Terraform believe things exist that don't, causing confusing diffs (usually harmless, since AWS just reports them missing and Terraform drops them from state). Bigger problem: with the `.tf` files gone too, there's no config at all - state alone is useless without it. The only ways back: restore the `.tf` files from git or a backup, or start fresh and use `terraform import` to re-adopt whatever's actually still running, one resource at a time.
+What does protocol = "-1" mean? :: AWS's own literal convention for "all protocols" - a wildcard, not a Terraform invention. It's exactly what you'd see in the raw AWS API/CLI (`IpProtocol: "-1"`) for the same rule. When protocol is "-1", `from_port`/`to_port` are ignored entirely since no single port range applies to "everything."
+I omitted ami entirely - fmt/validate/plan showed nothing, only apply failed with "ImageID is required." When will I actually catch this? :: `ami` isn't unconditionally required in the schema - `aws_instance` can be launched via `ami` or via a `launch_template` block instead, so the schema marks it Optional with a "you need one or the other" rule that only AWS's own API actually enforces. Static `validate`/`plan` only check syntax and argument types, not that kind of business rule - which is why "ImageID is required" is a raw AWS API message, not a native Terraform diagnostic. `plan` is a dry run of what Terraform intends to send; `apply` is the only place you learn what AWS will actually accept.
+"Creation complete after 16s" - does that mean the web app is already serving? :: No - that line only means the EC2 API call succeeded (the instance object now exists). Terraform only talks to AWS's control plane, never the guest OS, so boot time plus your user_data script all happen afterward, completely invisible to Terraform. The only real way to know: check yourself - curl it, or look inside the instance.
+curl didn't work, I found via SSH that user_data failed and fixed it manually - any other way to find and fix it? :: `aws ec2 get-console-output --instance-id <id>` is the fastest non-SSH way to see exactly what user_data/cloud-init did, since cloud-init logs its own run into the console output on Amazon Linux. The same log lives inside the instance too, at `/var/log/cloud-init-output.log`. The more important half: a manual in-instance edit doesn't survive - the moment the ASG replaces this instance, the fix is gone, because the real, permanent fix has to go into the launch template's user_data itself.
+What is terraform output, how do I use it, and where do outputs get saved? :: A fair gap - the CHECK blocks used an awkward fallback one-liner without properly introducing it. `terraform output` reads the values declared in your `output { ... }` blocks straight out of `terraform.tfstate` after a successful apply - it doesn't re-query AWS. `terraform output alb_dns_name` prints just that value; add `-raw` to strip the surrounding quotes so it's safe to drop into a shell command; run it with no name and it prints every declared output. They're not saved to a separate file - they live inside `terraform.tfstate` itself, under its "outputs" key.
+terraform output gave "Warning: No outputs found" - why? :: Means no output values exist in state yet. Two likely causes: you ran it from a directory with no terraform.tfstate in it, or you added the output block to main.tf *after* your last successful apply - outputs only get written into state during an apply that includes them, so you need to apply at least once more.
+"Note: You didn't use the -out option..." - what does that mean? :: It's warning about a gap between planning and applying - real AWS state could in theory change between when you review a plan and when you apply it. `terraform plan -out=myplan` freezes the exact computed plan to a file, and `terraform apply "myplan"` guarantees it applies precisely that plan, erroring instead of silently recomputing if anything's drifted. Plain `terraform apply` always recomputes its own fresh plan live - fine solo, but in a team/CI setting that gap is exactly how "it looked safe when I reviewed it" surprises happen. It's the exact two-step pattern used throughout today's migration work.
+Got us-east-1b/us-east-1f instead of 1a/1b from the default subnets data source - why? :: Same lesson already covered on the ASG page: AWS deliberately randomizes which physical availability zone maps to which letter *per AWS account*, to spread load across real physical zones instead of everyone's "us-east-1a" landing on the same datacenter. `data.aws_subnets.default.ids` returns whatever subnets exist in your account's default VPC, in no guaranteed order - `ids[0]`/`ids[1]` mean "whichever two came back first," not "the first two alphabetically." Relying on AZ letters for anything meaningful is a real, common anti-pattern.
+Changed the launch template's user_data (version 2); ASG still referenced v1 even with version = latest_version - what now? :: Setting `launch_template.version` to `.latest_version` only changes what version *new* instances will use going forward - it does not retroactively touch instances already running under the old version. That's fault 5 in the table above: already-running instances keep their original template version until something actually replaces them (a real scaling event, manual termination, or a deliberate refresh).
+Huge generated launch template / instance names - why, and how to control them? :: That's exactly what name_prefix does by design - AWS appends a unique, essentially-random suffix after your prefix to guarantee no collision, in exchange for never picking the exact name yourself. You can't shorten that suffix; it's generated server-side. If you want the exact string, use `name` instead and give up the automatic-uniqueness safety net. For anything a human actually needs to read in the console, this page already uses the right tool: `tags = { Name = "..." }`.
+I updated to version = latest_version and applied - I verified instances will be replaced automatically :: Worth double-checking rather than taking at face value - this is easy to get backwards. Changing the ASG's referenced version does not by itself replace already-running instances (see fault 5). If you saw instances land on v2 without a deliberate scale cycle, the more likely explanation is you were watching *new* instances from an unrelated scaling/health event, not your *existing* ones being refreshed in place. Worth running `aws autoscaling describe-auto-scaling-groups` and checking each instance's actual LaunchTemplate.Version to see which case you're really in.
+Why did we not create a separate security group for the ALB, like in lesson 1? :: Worth clearing up - this page never actually had a separate ALB security group. Step 3's shown code always used the *same* aws_security_group.web for both the ALB and the instances. The separate aws_security_group.alb that caused fault 1 was something you added independently during the VPC migration, beyond what the lesson showed - a good real-world instinct (splitting ALB and instance security groups is generally better practice), just introduced without the ForceNew/ordering awareness needed to migrate it safely, which is exactly how it became fault 1.
+If apply fails partway through, does it roll back or leave partial creation? :: Partial - never rolled back. Terraform writes state incrementally, as each individual resource operation succeeds, not all at once at the end. If resource #5 fails, resources #1 through #4 that already succeeded stay created and stay recorded in state. You just fix the real problem and re-apply; Terraform only acts on whatever's still outstanding. You saw this directly with the ASG ValidationError - interrupting it didn't destroy anything already built.
+Does the order of resource blocks in the .tf file matter? :: No, not at all - one of the very first definitions on this page (HCL, in "pieces"): Terraform builds its entire execution order from resource *references*, never from the order blocks appear in the file. You could paste every block on this page in reverse order and get the identical plan.
+Why are some resource local names "web" and others "main"? :: Pure naming convention - your choice as the author, no functional meaning to Terraform. Resources that are "the one app stack" use web (security group, launch template, ASG, ALB, listener, target group); resources that are "the only one of their kind in this config" use main (one VPC, one Internet Gateway). The route table uses public (its role); the subnets use public_a/public_b (role plus position). Any consistent, readable convention works equally well.
+Why can't I set a name field on the route table or Internet Gateway - validate threw errors? :: Because those two resource types genuinely have no `name` argument at all in the AWS provider's schema - unlike aws_security_group, aws_lb, or aws_lb_target_group, which do. The only way to give them a human-readable name is the same `tags = { Name = "..." }` convention the subnets and VPC already use. validate was correctly telling you `name` isn't a real argument for those two resource types.
+Why did updating the ASG's subnets hang on "Still modifying..." for 8+ minutes before erroring? :: This is fault 2 from the table above, caught live before the SG fix was in place - the launch template's security group wasn't yet migrated to the new VPC, so AWS correctly refused to let new instances in the new subnets use a security group from a different VPC.
+How much time would the error have taken to show if I hadn't interrupted at 8m30s? :: Honestly, uncertain down to the minute - the visible "Still modifying..." duration is Terraform's own wait loop for the ASG to finish stabilizing after the API call, not necessarily how long the validation check itself took. A structurally invalid request like this is usually rejected by AWS fairly fast, but Terraform's wrapper can keep polling the broader operation's progress before that rejection surfaces back to your terminal - so the delay isn't a reliable signal either way. Interrupting and re-applying after the real fix was the right call regardless.
+How would I know which service depends on which for deletion order? :: Direct answer is the fault-injection table and the two bash blocks above it - that two-step -target pattern and the scale-to-zero cycle *are* the concrete answer. The generalizable rule: trust Terraform's dependency graph for anything still present and referenced in your current config. Don't trust it the moment you're replacing a resource that's still live-connected to other things in actual AWS reality outside what the graph can see.
+I replaced security group, then ASG, then target group/ALB one at a time and got stuck in the same loop you solved - why, and how to avoid it next time? :: Each individual replacement was reasonable, but chaining several across unrelated resources in one blind sequence is exactly what caused it. Going forward: after any single resource gets replaced, run a plain terraform plan before touching the next one, and actually read it for anything surprising - a stray destroy, a deposed object - before moving on.
+Most of this - sequencing, dependency, name_prefix, lifecycle, why the ASG needed scaling, why the ALB needed -replace - wasn't taught up front :: Fair, and accurate - no deflecting. Those were genuinely absent from the original hands-on text. They only got written in - into the hands-on NOTE and the fault-injection stage - after you'd already lived through hitting every one of them. That's a real gap in content I authored, not something you should have known in advance. It's fixed now on the page for anyone who goes through Part 1 after you.
+Why is name_prefix capped at exactly 6 characters for aws_lb_target_group? :: AWS target group names have a hard 32-character total limit, and the generated unique suffix appended after name_prefix is a fixed 26 characters - 32 minus 26 leaves exactly 6 characters of budget for your own prefix text. Most other AWS resources with name_prefix have a much longer total name limit, so you don't normally run into this.
+Explain the two-step -target fix in more detail :: Step one, `terraform apply -target="aws_lb.web"`, tells Terraform "only plan and apply changes to this one resource and anything it strictly depends on - ignore everything else for now." That updated just the ALB's security-group reference, safely detaching it from the old SG. Step two is then a completely normal, untargeted plan/apply - which now sees the ALB already fixed, and the only remaining work is destroying the now-truly-unattached security group, which AWS allows instantly. The trick: splitting it into two separate applies forces the ordering one combined apply wasn't guaranteed to get right on its own.
+Can you add an architecture diagram after the conclusion, like the VPC page? :: Yes - same approach as the VPC page, the Python diagrams library already installed on this machine. I'll generate one showing this page's final migrated state - VPC, public subnets, ASG, ALB, target group - and add it right after the conclusion once that's written.
+
+[STAGE key-insight]
+HEADING: Five tools, one decision flow - a quick reference before you practice
+[P]
+Keep this open while you work through the migration below. None of these five are interchangeable - each answers a different question at a different point in the same workflow.
+[TABLE]
+Tool | Use it when | Today's real example
+ForceNew | Not something you set - read it from `terraform plan` output to predict whether a change destroys-and-recreates or updates in place. `-/+` or a `# forces replacement` comment means ForceNew; a plain `~` means it isn't - even when you expected it to be. | `aws_security_group.vpc_id` showed `-/+`. `aws_lb.subnets` showed only `~` - the actual trap.
+`lifecycle { create_before_destroy = true }` | Plan shows `-/+` on a resource that something else is still actively attached to right now. Add it before applying, not after getting stuck. | `aws_security_group.web`'s vpc_id change.
+`name_prefix` instead of `name` | `create_before_destroy` is in play and the resource's naming uniqueness is broader than per-VPC (region or account-scoped, not VPC-scoped). | `aws_lb_target_group` - a fixed name would collide with itself during the brief overlap.
+`-target` | Force an order Terraform's own graph won't guarantee, or retry just one piece of a stuck or partial apply. Not for routine use - needing it every apply means your config's dependencies aren't really expressing what you think they are. | Detaching the ALB from its old SG before destroying that SG; later, scaling the ASG through 0 without touching anything else.
+`-replace` | Plan shows a harmless `~ update in-place`, but you know AWS will actually reject it, because the attribute isn't ForceNew in the schema even though your specific change needs it to be. Use narrowly - forcing a replace on something that could update cleanly is wasteful, and for some resources (like an ALB) means losing something stable, like its DNS name. | Moving `aws_lb.web`'s subnets across VPCs.
+[NUMBERED]
+The actual decision flow, in order: change the attribute, then run terraform plan.
+Does plan show -/+ replace? That's ForceNew. Ask: is the old resource still actively used by something else right now? If yes, add create_before_destroy (plus name_prefix if the naming is broader than per-VPC) before you apply.
+Does plan show a plain ~ update in-place, but you know better than the schema does? That's your signal to use -replace explicitly.
+Does a destroy ever hang, or does the ordering go wrong anyway? Stop the apply safely, then use -target to split the work into a correctly-sequenced pair of applies.
+
+[STAGE hands-on]
+HEADING: Practice: a second stack ("tuf"), this time with private subnets
+[P]
+Self-directed from here - no worked solution for the migration part. Build a second, independent stack called "tuf" (separate resource addresses, so it doesn't touch anything tf1 already has running), starting in the default VPC exactly like tf1 did. Then migrate it into a brand new VPC that has both public AND private subnets - the real production pattern from the VPC page (ALB public, instances private) - applying every fault from the table above yourself, plus one new wrinkle tf1 never had.
+[CODE lang=hcl caption="Part A: the tuf stack, in the default VPC - same shape as tf1, new names"]
+resource "aws_security_group" "tuf" {
+  name   = "tuf-web-sg"
+  vpc_id = data.aws_vpc.default.id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["YOUR_IP/32"]              # your real public IP, not a placeholder
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_launch_template" "tuf" {
+  name_prefix   = "tuf-web-"
+  image_id      = "ami-0abcd1234efgh5678"     # a real Amazon Linux 2023 AMI id for your region
+  instance_type = "t3.micro"
+  key_name      = "your-keypair-name"
+  vpc_security_group_ids = [aws_security_group.tuf.id]
+  user_data = base64encode(<<-EOF
+    #!/bin/bash
+    dnf install -y nginx
+    systemctl enable --now nginx
+  EOF
+  )
+}
+
+resource "aws_autoscaling_group" "tuf" {
+  name                = "tuf-web-asg"
+  min_size            = 2
+  desired_capacity    = 2
+  max_size            = 4
+  vpc_zone_identifier = data.aws_subnets.default.ids
+  health_check_type   = "EC2"
+
+  launch_template {
+    id      = aws_launch_template.tuf.id
+    version = "$Latest"
+  }
+  tag {
+    key                 = "Name"
+    value               = "tuf-asg-instance"
+    propagate_at_launch = true
+  }
+}
+
+resource "aws_lb_target_group" "tuf" {
+  name     = "tuf-web-tg"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = data.aws_vpc.default.id
+  health_check {
+    path                = "/"
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+    interval            = 15
+  }
+}
+
+resource "aws_autoscaling_attachment" "tuf" {
+  autoscaling_group_name = aws_autoscaling_group.tuf.name
+  lb_target_group_arn    = aws_lb_target_group.tuf.arn
+}
+
+resource "aws_lb" "tuf" {
+  name               = "tuf-web-alb"
+  internal           = false
+  load_balancer_type = "application"
+  subnets            = data.aws_subnets.default.ids
+  security_groups    = [aws_security_group.tuf.id]
+}
+
+resource "aws_lb_listener" "tuf" {
+  load_balancer_arn = aws_lb.tuf.arn
+  port              = 80
+  protocol          = "HTTP"
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.tuf.arn
+  }
+}
+
+output "tuf_alb_dns_name" { value = aws_lb.tuf.dns_name }
+[CODE lang=bash caption="CHECK A - plan, apply, curl it, exactly like tf1's own checks"]
+terraform plan
+terraform apply
+curl http://$(terraform output -raw tuf_alb_dns_name)
+[CODE lang=hcl caption="Part B: a second VPC with BOTH public and private subnets, NAT Gateway per AZ"]
+resource "aws_vpc" "tuf" {
+  cidr_block = "10.3.0.0/16"
+  tags       = { Name = "tuf-vpc" }
+}
+
+resource "aws_subnet" "tuf_public_a" {
+  vpc_id                  = aws_vpc.tuf.id
+  cidr_block               = "10.3.1.0/24"
+  availability_zone        = "us-east-1a"
+  map_public_ip_on_launch  = true
+  tags = { Name = "tuf-public-a" }
+}
+resource "aws_subnet" "tuf_public_b" {
+  vpc_id                  = aws_vpc.tuf.id
+  cidr_block               = "10.3.2.0/24"
+  availability_zone        = "us-east-1b"
+  map_public_ip_on_launch  = true
+  tags = { Name = "tuf-public-b" }
+}
+resource "aws_subnet" "tuf_private_a" {
+  vpc_id                  = aws_vpc.tuf.id
+  cidr_block               = "10.3.11.0/24"
+  availability_zone        = "us-east-1a"
+  map_public_ip_on_launch  = false
+  tags = { Name = "tuf-private-a" }
+}
+resource "aws_subnet" "tuf_private_b" {
+  vpc_id                  = aws_vpc.tuf.id
+  cidr_block               = "10.3.12.0/24"
+  availability_zone        = "us-east-1b"
+  map_public_ip_on_launch  = false
+  tags = { Name = "tuf-private-b" }
+}
+
+resource "aws_internet_gateway" "tuf" {
+  vpc_id = aws_vpc.tuf.id
+  tags   = { Name = "tuf-igw" }
+}
+
+resource "aws_eip" "tuf_nat_a" { domain = "vpc" }
+resource "aws_eip" "tuf_nat_b" { domain = "vpc" }
+
+resource "aws_nat_gateway" "tuf_a" {
+  allocation_id = aws_eip.tuf_nat_a.id
+  subnet_id     = aws_subnet.tuf_public_a.id   # NAT Gateways live in a PUBLIC subnet
+  tags          = { Name = "tuf-nat-a" }
+}
+resource "aws_nat_gateway" "tuf_b" {
+  allocation_id = aws_eip.tuf_nat_b.id
+  subnet_id     = aws_subnet.tuf_public_b.id
+  tags          = { Name = "tuf-nat-b" }
+}
+
+resource "aws_route_table" "tuf_public" {
+  vpc_id = aws_vpc.tuf.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.tuf.id
+  }
+}
+resource "aws_route_table" "tuf_private_a" {
+  vpc_id = aws_vpc.tuf.id
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.tuf_a.id   # az a's instances exit via az a's own NAT
+  }
+}
+resource "aws_route_table" "tuf_private_b" {
+  vpc_id = aws_vpc.tuf.id
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.tuf_b.id
+  }
+}
+
+resource "aws_route_table_association" "tuf_public_a" {
+  subnet_id      = aws_subnet.tuf_public_a.id
+  route_table_id = aws_route_table.tuf_public.id
+}
+resource "aws_route_table_association" "tuf_public_b" {
+  subnet_id      = aws_subnet.tuf_public_b.id
+  route_table_id = aws_route_table.tuf_public.id
+}
+resource "aws_route_table_association" "tuf_private_a" {
+  subnet_id      = aws_subnet.tuf_private_a.id
+  route_table_id = aws_route_table.tuf_private_a.id
+}
+resource "aws_route_table_association" "tuf_private_b" {
+  subnet_id      = aws_subnet.tuf_private_b.id
+  route_table_id = aws_route_table.tuf_private_b.id
+}
+[CODE lang=bash caption="CHECK B - plan, apply, nothing wired to it yet so nothing else changes"]
+terraform plan
+terraform apply
+[NUMBERED]
+Now the actual migration - your turn, no code handed to you this time. Work through every item below yourself:
+Split aws_security_group.tuf into two separate security groups instead of one shared one: an ALB-facing SG (port 80 from 0.0.0.0/0, in aws_vpc.tuf) and an instance-facing SG (port 80 allowed ONLY from the ALB security group's id, not from 0.0.0.0/0). tf1 never forced this fix - this is the gap from the very first review of this page, now worth actually closing.
+Both new security groups have a vpc_id change coming (default VPC to aws_vpc.tuf) - that's ForceNew, so both need lifecycle { create_before_destroy = true } before you touch vpc_id, exactly like tf1's aws_security_group.web did.
+aws_lb_target_group.tuf's vpc_id is also moving - switch its name to name_prefix (6 characters max, remember) and add create_before_destroy, same fix as tf1tg.
+aws_lb.tuf's subnets need to move to aws_vpc.tuf's PUBLIC subnets. This attribute is not ForceNew in the schema - plan will show it as a harmless update, and you already know why that's not actually safe. Force the replacement yourself with terraform apply -replace="aws_lb.tuf" when you get to this step.
+aws_autoscaling_group.tuf's vpc_zone_identifier needs to move to aws_vpc.tuf's PRIVATE subnets this time, not public. Existing instances will not follow on their own - cycle min_size/desired_capacity through 0 and back, same as tf1's fault 5. Stretch goal, beyond anything tf1 used: look up the instance_refresh block on aws_autoscaling_group instead of the scale-cycle, and see if you can get a real rolling refresh working.
+New wrinkle tf1 never had: these instances get no public IP and aren't reachable directly from the internet at all - their only path out is through the NAT Gateway route you built in Part B. If that route isn't correctly wired before an instance launches, user_data will fail silently with no public IP to even curl and check - this is doubt 10 from above, for real this time. Use aws ec2 get-console-output --instance-id <id> to confirm cloud-init actually succeeded before you assume anything else is broken.
+[CODE lang=bash caption="CHECK C - confirm the end state, not just that apply succeeded"]
+curl http://$(terraform output -raw tuf_alb_dns_name)
+# still works - the ALB's address never changes even though everything behind it moved
+
+aws ec2 describe-instances --filters "Name=tag:Name,Values=tuf-asg-instance" \
+  --query 'Reservations[].Instances[].[InstanceId,PrivateIpAddress,PublicIpAddress,SubnetId]' --output table
+# PublicIpAddress should be None/null for every row - that's the point
+
+aws ec2 get-console-output --instance-id <one-of-the-instance-ids> | grep -i "cloud-init"
+# confirms user_data actually ran to completion through the NAT path, not just that the instance exists
+
+[STAGE conclusion]
+HEADING: Two working stacks, one hard-won set of rules
+[P]
+Everything in Terraform's own vocabulary from here on maps directly onto something you actually did, twice: a provider talking to one AWS account; resources for every piece of EC2/ASG/ALB/VPC you already built by hand with the CLI; a state file that remembered all of it across two separate stacks (tf1 and tuf) without you ever re-typing an ID; a plan that mostly told the truth, except for the one place its own schema couldn't see your intent.
+[BULLETS]
+tf1 went from a single hardcoded EC2 instance to a full ASG-behind-an-ALB stack, then migrated whole into a custom VPC - and broke, for real, in five distinct ways along the way.
+Every one of those five failures came from the same root cause wearing a different costume: Terraform's plan only knows what the provider's schema tells it to check, and AWS's actual API is the only thing that enforces the rest.
+tuf repeated the same migration with one upgrade - private subnets behind a NAT Gateway, the ALB and the instances finally on separate security groups - applying every fix from the table yourself instead of being walked through it.
+Nothing here used a single variable, a single `count`, or a single module. Every AMI id, every CIDR block, every subnet's availability zone was typed out by hand, more than once in places - which is exactly what made the copy-paste AZ bug and the duplicated AMI id real, visible risks instead of abstract warnings.
+[NOTE]
+Part 2 picks up exactly where this leaves off: turning every one of those hand-typed, duplicated values into variables, and the repeated per-subnet blocks (subnets, route table associations, the pattern you hit again building tuf's four subnets by hand) into `count`/`for_each`. You now have first-hand proof of what that duplication actually costs when it goes wrong - Part 2 is about making that specific class of mistake structurally impossible instead of just risky.

@@ -35,6 +35,11 @@ dist-ssr
 # file, and eventually state - state can contain real resource data/IDs)
 /terraform/
 preview*.log
+save_server.log
+
+# Local save-server output - runtime data, not source content. The seed
+# content in src/data/content/*.txt stays the source of truth.
+/coach-mode-data.json
 
 # Personal planning docs and pre-React prototype files - not part of the app,
 # kept locally only (not published to the public repo)
