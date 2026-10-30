@@ -1,0 +1,358 @@
+MODULE: terraform-3
+TITLE: Terraform — Part 3: Modules
+COVERED: 2026-10-29
+
+[STAGE knowledge]
+HEADING: Same stack, written once, called twice
+[P]
+tf1 (Part 1) and tf2 (Part 2) are structurally almost identical - a VPC, subnets, a security group, a launch template, an ASG, a target group, an ALB, a listener. Only the VALUES differ: project name, CIDR ranges, instance size. Part 2 already solved "the same value typed more than once" with variables. What's left is "the same STRUCTURE written out more than once" - every resource block in tf2's main.tf exists, nearly verbatim, in tf1's main.tf too. A module packages that whole shape into one reusable unit, written exactly once, then called as many times as needed with different inputs. This is the final step in the duplication story that started with Part 1's duplicated AMI id.
+
+[STAGE pieces]
+HEADING: module block, source, inputs, outputs, encapsulation
+[DIAGRAM nodes="modules/web-stack/ (written once)|module tf3a call (project_name=a)|module tf3b call (project_name=b)|two independent stacks" highlight="modules/web-stack/ (written once)"]
+[DEFS]
+Module :: a directory containing its own .tf files - variables.tf (its inputs), main.tf (its resources), outputs.tf (its outputs) - that can be called from elsewhere instead of writing those resources inline.
+module block :: `module "name" { source = "./path" ... }` in a CALLING file - source points at the module's directory, the remaining arguments supply values for that module's own declared variables.
+Root module :: the top-level configuration you run terraform commands from. Everything that isn't inside a module block's own directory.
+Child module :: a module being called - its resources exist, but they're addressed through the module call, not directly from the root.
+module.NAME.output :: how the root (or another module) reads a value a child module explicitly exposed via its own outputs.tf - `module.tf3a.alb_dns_name`. Nothing inside a module is reachable from outside unless it's an output.
+terraform init :: already familiar from every earlier page - but it does one more job now. init is what actually goes and reads a module's source directory and wires it into the configuration; adding or changing a module block always requires re-running it.
+
+[STAGE hands-on]
+HEADING: The tf2 stack, extracted into one reusable module, called twice
+[P]
+Same resource shapes as Part 2 - VPC, for_each subnets, security group, launch template, ASG, target group, ALB, listener - moved into a module directory, written once. The root then calls that module twice with different project names, producing two fully independent stacks from one set of files.
+[CODE lang=tree caption="directory layout"]
+.
+├── main.tf              (root - provider + two module calls)
+├── outputs.tf           (root - re-exposes each stack's ALB DNS name)
+└── modules/
+    └── web-stack/
+        ├── variables.tf (the module's own inputs)
+        ├── main.tf       (every resource - VPC through ALB)
+        └── outputs.tf    (what the module exposes to its caller)
+[CODE lang=hcl caption="modules/web-stack/variables.tf - this module's own inputs, declared independently of the root"]
+variable "project_name" {
+  description = "Prefix for every resource this module instance creates"
+  type        = string
+}
+
+variable "ami_id" {
+  type = string
+}
+
+variable "instance_type" {
+  type    = string
+  default = "t3.micro"
+}
+
+variable "key_name" {
+  type = string
+}
+
+variable "allowed_ssh_cidr" {
+  type = string
+}
+
+variable "vpc_cidr" {
+  type = string
+}
+
+variable "public_subnets" {
+  description = "Keyed by a stable name, not list position - same reasoning as Part 2"
+  type = map(object({
+    cidr_block        = string
+    availability_zone = string
+  }))
+}
+
+variable "asg_min_size" {
+  type    = number
+  default = 2
+}
+
+variable "asg_max_size" {
+  type    = number
+  default = 4
+}
+[CODE lang=hcl caption="modules/web-stack/main.tf - every resource, written exactly once"]
+resource "aws_vpc" "main" {
+  cidr_block = var.vpc_cidr
+  tags       = { Name = "${var.project_name}-vpc" }
+}
+
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+  tags   = { Name = "${var.project_name}-igw" }
+}
+
+resource "aws_subnet" "public" {
+  for_each                = var.public_subnets
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = each.value.cidr_block
+  availability_zone       = each.value.availability_zone
+  map_public_ip_on_launch = true
+  tags = { Name = "${var.project_name}-public-${each.key}" }
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+}
+
+resource "aws_route_table_association" "public" {
+  for_each       = aws_subnet.public
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_security_group" "web" {
+  name   = "${var.project_name}-web-sg"
+  vpc_id = aws_vpc.main.id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.allowed_ssh_cidr]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_launch_template" "web" {
+  name_prefix             = "${var.project_name}-web-"
+  image_id                = var.ami_id
+  instance_type            = var.instance_type
+  key_name                 = var.key_name
+  vpc_security_group_ids   = [aws_security_group.web.id]
+  user_data = base64encode(<<-EOF
+    #!/bin/bash
+    dnf install -y nginx
+    systemctl enable --now nginx
+  EOF
+  )
+}
+
+resource "aws_autoscaling_group" "web" {
+  name                = "${var.project_name}-asg"
+  min_size            = var.asg_min_size
+  desired_capacity    = var.asg_min_size
+  max_size            = var.asg_max_size
+  vpc_zone_identifier = [for s in aws_subnet.public : s.id]
+  health_check_type   = "EC2"
+
+  launch_template {
+    id      = aws_launch_template.web.id
+    version = "$Latest"
+  }
+  tag {
+    key                 = "Name"
+    value               = "${var.project_name}-asg-instance"
+    propagate_at_launch = true
+  }
+}
+
+resource "aws_lb_target_group" "web" {
+  name_prefix = substr(var.project_name, 0, 6)
+  port        = 80
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.main.id
+
+  lifecycle {
+    create_before_destroy = true
+  }
+  health_check {
+    path                = "/"
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+    interval            = 15
+  }
+}
+
+resource "aws_autoscaling_attachment" "web" {
+  autoscaling_group_name = aws_autoscaling_group.web.name
+  lb_target_group_arn    = aws_lb_target_group.web.arn
+}
+
+resource "aws_alb" "web" {
+  name               = "${var.project_name}-alb"
+  internal           = false
+  load_balancer_type = "application"
+  subnets            = [for s in aws_subnet.public : s.id]
+  security_groups    = [aws_security_group.web.id]
+}
+
+resource "aws_lb_listener" "web" {
+  load_balancer_arn = aws_alb.web.arn
+  port              = 80
+  protocol          = "HTTP"
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.web.arn
+  }
+}
+[CODE lang=hcl caption="modules/web-stack/outputs.tf - the ONLY things visible outside this module"]
+output "alb_dns_name" {
+  value = aws_alb.web.dns_name
+}
+
+output "vpc_id" {
+  value = aws_vpc.main.id
+}
+[CODE lang=hcl caption="main.tf - the root. Calls the same module twice, different inputs each time"]
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+}
+
+module "tf3a" {
+  source            = "./modules/web-stack"
+  project_name      = "tf3a"
+  ami_id            = "ami-0abcd1234efgh5678"
+  key_name          = "your-keypair-name"
+  allowed_ssh_cidr  = "203.0.113.5/32"
+  vpc_cidr          = "10.5.0.0/16"
+  public_subnets = {
+    a = { cidr_block = "10.5.1.0/24", availability_zone = "us-east-1a" }
+    b = { cidr_block = "10.5.2.0/24", availability_zone = "us-east-1b" }
+  }
+}
+
+module "tf3b" {
+  source            = "./modules/web-stack"
+  project_name      = "tf3b"
+  ami_id            = "ami-0abcd1234efgh5678"
+  key_name          = "your-keypair-name"
+  allowed_ssh_cidr  = "203.0.113.5/32"
+  vpc_cidr          = "10.6.0.0/16"            # different VPC CIDR - two fully independent stacks, zero overlap
+  public_subnets = {
+    a = { cidr_block = "10.6.1.0/24", availability_zone = "us-east-1a" }
+    b = { cidr_block = "10.6.2.0/24", availability_zone = "us-east-1b" }
+  }
+}
+[CODE lang=hcl caption="outputs.tf - the root re-exposing each module instance's own outputs"]
+output "tf3a_alb_dns_name" {
+  value = module.tf3a.alb_dns_name
+}
+
+output "tf3b_alb_dns_name" {
+  value = module.tf3b.alb_dns_name
+}
+[CODE lang=bash caption="CHECK - init (required for the new module source), plan, apply, curl BOTH"]
+terraform init      # reads modules/web-stack and wires it in - required any time a module source changes
+terraform plan
+terraform apply
+curl http://$(terraform output -raw tf3a_alb_dns_name)
+curl http://$(terraform output -raw tf3b_alb_dns_name)
+# two fully separate, fully working stacks, from one module written once
+
+[STAGE troubleshoot]
+HEADING: Reaching into a module from outside it
+[P]
+You want the tf3a stack's VPC id for something - a quick debugging query, a one-off reference. The instinct, since you've been writing aws_vpc.main.id directly for two whole pages, is to reach for the same pattern:
+[CODE lang=hcl caption="the natural-looking mistake"]
+output "tf3a_vpc_id_attempt" {
+  value = module.tf3a.aws_vpc.main.id   # reaching past the module into its internals
+}
+[CODE lang=bash caption="terraform plan / validate"]
+terraform validate
+# Error: Unsupported attribute
+#   value = module.tf3a.aws_vpc.main.id
+# This object does not have an attribute named "aws_vpc"
+[P]
+module.tf3a is not a bag of resources you can reach into - it's a boundary. The ONLY things visible from outside a module are whatever it explicitly declared in its own outputs.tf. aws_vpc.main exists inside modules/web-stack/main.tf, but from the root's point of view, it simply does not exist - only module.tf3a.alb_dns_name and module.tf3a.vpc_id do, because those are the two outputs the module chose to expose.
+
+[STAGE key-insight]
+HEADING: Encapsulation is what makes "call it twice" actually safe
+[NOTE]
+This is not a limitation to work around - it's the entire reason modules eliminate duplication safely. Every resource inside modules/web-stack/main.tf is written with plain local names - aws_vpc.main, aws_security_group.web - with no project_name baked into the Terraform address itself. Calling the module twice (tf3a, tf3b) doesn't cause a naming collision, because each call gets its own implicit namespace: the real addresses are module.tf3a.aws_vpc.main and module.tf3b.aws_vpc.main, automatically, without either module call needing to know the other exists. Contrast this with Part 1 and Part 2, where every single resource needed project_name or a unique local name hand-woven into it specifically to avoid collisions across tf1/tf2/tuf1. A module needs none of that discipline internally - it only needs a unique call name (module "tf3a" vs module "tf3b") at the one point where it's actually called twice. If you need the vpc_id for something outside the module, the fix isn't reaching past the boundary - it's adding one more line to modules/web-stack/outputs.tf, deliberately deciding to expose it.
+[P]
+One more connection back to Part 2: moved blocks aren't only for count-to-for_each conversions. Terraform's moved block also explicitly supports restructuring plain resources INTO a module (or out of one) without destroying and recreating them - exactly the kind of refactor this page just did, taking tf2's inline resources and relocating them into modules/web-stack. A real migration of an already-live stack into this module structure would use moved blocks the same way Part 2's key-insight introduced them: a pure address change, from aws_vpc.main (root) to module.web_stack.aws_vpc.main, with the underlying VPC never touched.
+
+[ROUND terraform3_r1]
+QUESTION: The troubleshoot above showed module.tf3a.aws_vpc.main.id failing because a module's internal resources aren't reachable from outside it. Explain precisely why this same encapsulation is what lets module "tf3a" and module "tf3b" both declare a resource named aws_vpc.main inside modules/web-stack/main.tf without colliding - contrast this with how much naming discipline Part 1 and Part 2 needed (project_name woven into every single resource name) to let tf1, tf2, and tuf1 coexist. Then: if you added a third call, module "tf3c" { source = "./modules/web-stack" ... }, what - if anything - would you need to change inside modules/web-stack/main.tf itself to support it? Finally: suppose tf2's resources (from Part 2, still live, still in tf2's own root main.tf, not using a module at all) needed to be restructured into this same module shape without any downtime or resource recreation - name the tool from Part 2 that makes this possible, and what it would need to map FROM and TO for just the aws_vpc.main resource specifically.
+DOUBTS:
+ANSWER: Uh the same encapsulation that failed for module tf3 VPC main dot ID was like it was uh unable to call the child Resources Because it was unable to see the child resources Exposed Output values there so it was not visible to it it was only visible to the child modules only so this enscapulation is like it is basically giving The variables whatever the variables that we have encapsulated these variables are password to the variables inside shared process as input and those inputs are being used by the shared main dot TF file and this tfl file is the Root of it that is deploying the resources onto the infrastructure So the encapsulation here only feeding the values To the child processor a child modules it is not creating here on the route Road module okay that is the main distinction that I want to point it out so there is no need for us to migrate tf1 TF2 and tough one Uh changing the names we just need to pass in the values in the Root module Uh with different variables values that we have used already So that's how we are going to use it because these are going to pass as a input To the variables files inside child Module files Uh next thing is like they can also coexistically if we create a third module tf3c Uh we are not going to touch module slash web stack slash main Uh the TF file itself to support it we are just going to change Uh modules slash main.tfi the root main.tf file and we are going to pass in the variables that are required for tf3c stack Suppose if TF2 resources are already still live and they have their own Main.tf file And no module at all then I'll just use We are not going to shape anything so we are just going to take the variables whatever the variables that we have used Tf2 Of files so those variables I am going to collect and I am going to create a new model TF2 and inside that one I'm just going to pass those variables So that it will create a it will create or update it will check whether those users are still available or not Here we are going to map like from N2 for just AWS main is like we are going to change the cider block light every time we are changing a cider plug and that's where the real change was occurring so I'm just going to change the cidr block
+SAVEDAT: 2026-10-30T10:42:40.238Z
+REVIEWED: true
+VERDICT: partial
+ASSESSMENT: Part 1 is real but incomplete - you correctly connected encapsulation to visibility (child resources aren't reachable from outside unless exposed as outputs), which is genuinely part of the mechanism. But the question specifically asked about NAMING COLLISION, not visibility: why can module "tf3a" and module "tf3b" both declare a resource literally named aws_vpc.main without conflicting? That's answered by each module call getting its own implicit address namespace, not by output visibility - those are two different (related) things, and only one got addressed. You also skipped the explicit contrast the question asked for - how much naming discipline Part 1 and Part 2 needed (project_name woven into every resource name) versus none needed here. Part 2 (adding tf3c) is correct and clean: nothing changes inside modules/web-stack/main.tf, only a new module block with new variable values in the root. Part 3 is where it drifted - you described creating "a new model tf2" and passing variables, and mentioned changing CIDR blocks, but never named moved blocks, the specific tool Part 2 introduced that this question was pointing back to, and never gave the actual FROM/TO address mapping that was asked for.
+CLARIFICATION: Full answer for the record. Part 1 - the real mechanism is namespacing, not just visibility. Every resource inside modules/web-stack/main.tf has a plain local address - aws_vpc.main, aws_security_group.web - with no project_name or module-specific text baked into the Terraform address itself. When that module is called as module "tf3a" and module "tf3b", Terraform automatically prefixes each call's entire internal address space with its own call name: the real, full addresses become module.tf3a.aws_vpc.main and module.tf3b.aws_vpc.main. These are two completely different addresses to Terraform, even though the text written inside main.tf - aws_vpc.main - is identical in both cases. This is why zero internal naming discipline was needed: the module's author never has to know how many times, or under what names, their module will ever be called. Contrast this directly with Part 1 and Part 2: tf1, tf2, and tuf1 were NOT modules - they were separate root configurations (or, worse, briefly coexisting resources in the same root during migrations), so every single resource needed project_name or a unique local name hand-woven into it specifically to avoid real collisions. Part 2 - adding module "tf3c" { source = "./modules/web-stack" ... } requires zero changes inside modules/web-stack/main.tf itself - you only add a new module block in the ROOT main.tf, supplying tf3c's own project_name, CIDRs, and other variable values. The module's internal code has no idea how many times it's been called; it only ever sees whatever one set of input variables the current call passed it. Part 3 - the tool is moved blocks, from Part 2's key-insight (the same key-insight explicitly mentioned they also support moving a resource INTO a module, not just count-to-for_each). For tf2's aws_vpc.main specifically, migrating it into this module shape without downtime or recreation would need: moved { from = aws_vpc.main, to = module.web_stack.aws_vpc.main } - mapping FROM the root-level address tf2 currently uses TO the same resource's new address once it's nested inside a module call named web_stack. Written correctly, alongside actually restructuring tf2's resources into the module's files, Terraform sees this as a pure address rename - the real, live VPC is never touched, same principle as every moved block example on this page so far.
+
+[STAGE fault-injection]
+HEADING: Four ways module calls break, before AWS is even involved
+[P]
+Not live incidents this time - these are staged, but each one is a genuine, common mistake specific to calling a module, not a resource. Several of these get caught earlier than most faults on this page, which is itself worth noticing.
+[TABLE]
+Symptom | Real cause | Fix
+`terraform plan` fails immediately with Error: Missing required argument, before any AWS call happens | A third module call (tf3c) was added but one required variable - one with no default in variables.tf - was left out | Supply every variable that has no default, every time the module is called. A required variable with no default is deliberately strict - the module author decided callers must always provide it explicitly
+Error: Module not installed - Error: Unreadable module directory | A new module block was added (or an existing one's source path was changed) and terraform plan was run directly, skipping terraform init | Run terraform init any time a module block is added, removed, or its source path changes - plan and apply both assume modules are already downloaded/linked, they never do that work themselves
+Error: Duplicate module block - two instances with the same name "tf3a" | Copy-pasting a whole module block to create tf3c, then forgetting to rename the block's own label in `module "tf3a" { ... }` | Every module block's label, same as every resource block's local name, must be unique within its container - Terraform catches this at parse time, before plan or apply ever runs
+Adding count = 2 to a module block changes every output's shape from module.web.alb_dns_name to module.web[0].alb_dns_name and module.web[1].alb_dns_name, breaking every existing reference to the old output name | count and for_each work as meta-arguments on module blocks too, not just on resources - exactly the same position-vs-key distinction from Part 2, just one level up | Same rule as Part 2 applies here too: prefer for_each with a map of distinct configurations over count when the module instances aren't truly interchangeable copies - and update every reference to that module's outputs to match whichever addressing scheme was chosen
+[NOTE]
+The first two faults in this table are caught before terraform ever talks to AWS - a missing required variable fails at plan's own validation step, and a missing module source fails even earlier, at init. That's a real, structural difference from most of what broke on the tf1/tf2 live stacks: a ForceNew surprise or a DependencyViolation can only be discovered once AWS itself rejects something at apply time. Module-call mistakes tend to be caught early, by Terraform's own config-loading and type-checking - which is exactly the category of safety a well-designed module adds on top of everything Part 1 and Part 2 already covered.
+
+[ROUND terraform3_r2]
+QUESTION: The fault-injection table above says a missing required variable and a missing terraform init both get caught BEFORE any AWS call happens - earlier than most faults in Part 1 and Part 2's tables, which only surfaced at apply time once AWS itself rejected something. Explain precisely why module-call mistakes are generally caught earlier than the ForceNew/DependencyViolation class of fault from the live tf1/tf2 incidents - what is different about what Terraform can check for each. Then: the fourth fault row describes adding count = 2 to a module block, which changes module.web.alb_dns_name into module.web[0].alb_dns_name and module.web[1].alb_dns_name. If this module block were switched to for_each instead, keyed by a map with "a" and "b" entries, what would the equivalent output addresses look like - and using the Round 1 clarification's reasoning about resource addresses as your basis, explain why adding a third for_each key later wouldn't disturb the "a" or "b" instances, while adding a third count index would carry the exact same reordering risk Part 2's troubleshoot section demonstrated on plain resources.
+DOUBTS: new queries:-
+1. terraform init shall be used for every sub project inside root project (exclude-modules)
+2. can output holds more names like 'output "aws_dns" "aws_vpc_id"...."aws_subnets"{respective values)'
+3. explain error - terraform plan - Error: Inconsistent dependency lock file - The following dependency selections recorded in the lock file are inconsistent with the current configuration - provider registry.terraform.io/hashicorp/aws required by this configuration but no version is selected - To make the initial dependency selections that will initialize the dependency lock file, run terraform init
+4. i learned this tweak, like give basic resource structure and terraform plan will give you required attributes to fill. but cannot be used for live interview. only when there is gap between terraform will be useful.
+5. plan output shows aws_route_table.public will be created with route = [ { # (13 unchanged attributes hidden) } ] - how to view those (13 unchanged attributes hidden)?
+6. if some other modules from internet was brought, how to test them whether they work or not?
+7. resource "aws_route_table" "public"{ vpc_id = aws_vpc.main.id route{ gateway_id = aws_internet_gateway.main.id cidr_block="0.0.0.0/0" } } - how to add more routes?
+8. how to use target and replace cli cmd args in modules when tf plan/apply
+9. why tf fmt cmd not worked on modules/webstack/*.tf files?
+10. after modules tf3a,tf3b are created if i change something inside child module main.tf file what will happen? example: i add ami_id in defaults of child variable file or create a new sg with local name web2 to alb.
+ANSWER: In live TF1 and TF2 incidents the terraform call was happened with the AWS API call and that we found like ForceNew dependency violation faults were occur but when we are using modules this module call captures the mistakes by just comparing with the terraform's own config files and also with type checks and also any duplications are happening within them because since terraform modules use encapsulation they have namespacing instead of directly dependent on the variables whatever we pass in, so every module will have their own specific and unique values instead of colliding namespaces. And part two of this one is like when we are changing from count to for_each we need to check whether they are interchangeable copies or not - if not they will just get into the ForceNew and dependency violation again - if they are interchangeable copies then it would be easier for us to lose it, if they are not interchangeable copies then we need to go under their addresses and check for the actual value address and those actual value address only we need to use in for_each so that there will be no collision happens and nothing will get deleted. Since if a third count index were carried the exact same order then again we need to look under the same - there is not an interchangeable copy then we need to get the addresses from under the schema whatever the values that are there and we need to pass them exactly so we will not have that risk, and since once we pass them, since modules use namespacing over a key and index points this will be used for good.
+SAVEDAT: 2026-10-30T11:09:54.662Z
+REVIEWED: true
+VERDICT: partial
+ASSESSMENT: Part 1 is reasonable and in the right direction - you correctly connected module-call mistakes to static checks against Terraform's own config (type-checking, required arguments, duplicate labels) rather than needing a live AWS response, and tied it to namespacing/encapsulation. The core distinction (config-only check vs AWS-API check) came through, even if loosely worded. Part 2 is where this needed more - the question specifically asked you to WRITE OUT the equivalent for_each output addresses, and that was never given (the actual answer: module.web["a"].alb_dns_name and module.web["b"].alb_dns_name). The reasoning that followed stayed abstract ("interchangeable copies," "go under their addresses," "schema") without landing the one concrete mechanism the question was fishing for: map keys in for_each have no inherent order, so adding a third key can never shift what "a" or "b" point to - there's no position for a reorder to apply to, the same core idea from Part 2's key-insight, just one level up at the module-call level instead of the resource level.
+CLARIFICATION: Full answer for the record. Part 1 - module-call mistakes (missing required variable, missing terraform init, duplicate module label) are caught by Terraform parsing and type-checking its OWN configuration files - no network call, no AWS involved at all. A required variable with no value is a structural fact visible the moment the .tf files are read. A missing module source is a filesystem fact. A duplicate block label is a parse-time fact. None of these require asking AWS anything. ForceNew replacements and DependencyViolation errors are the opposite: ForceNew is a property the PROVIDER schema assigns per attribute (knowable from config plus the provider's compiled-in rules, which is why plan catches real ForceNew replacements) - but DependencyViolation specifically is not knowable from config or schema at all, because it depends on what's ACTUALLY attached to a resource in live AWS right now, which only AWS's own API can answer. That's the deeper line: config-and-schema-only checks happen at plan or even earlier; checks that depend on real-world attachment state can only happen when AWS is actually asked, at apply. Part 2 - module "web" { for_each = { a = {...}, b = {...} } ... } produces module.web["a"] and module.web["b"] as the real addresses, so the equivalent outputs are module.web["a"].alb_dns_name and module.web["b"].alb_dns_name. Exactly like Part 2's plain-resource for_each: a map key is just a label, not a position - there is no "slot" for a third key to be inserted into that could possibly bump "a" or "b" out of place, because for_each never asked "what's at position N," only "is there an entry under this exact key." Adding module.web["c"] later is purely additive - "a" and "b" keep the identical addresses and real resources they always had. count is different specifically because count.index IS position - aws_subnet.public[0] means "whatever is at index 0 right now," so inserting a new third element anywhere before the end of a count-driven list can silently redefine what index 0 or 1 now point to, forcing Terraform to see it as a replace even though nothing about that specific resource's intended configuration changed. Same root cause, same fix (for_each over count whenever instances aren't truly interchangeable), now shown to apply at the module-call level exactly as it did at the resource level in Part 2.
+DOUBT_ANSWERS: Does terraform init need to run for every sub-project inside the root, excluding modules? :: Reframe slightly: init runs once per ROOT module (the directory you actually run terraform commands from) - not once per resource or "sub-project" inside it, and modules never get their own separate init call at all, since the root's init is what downloads/links every module a root references. If you have genuinely separate root directories - like tf1, tf2, and this modules_lesson stack, each with their own provider block and state - each of those IS its own root and does need its own one-time init, because each has a completely independent state file and dependency lock file.
+Can one output block hold multiple names, like output with several values bundled together? :: No - each output block declares exactly one name and one value, always. But that one value CAN be a structured object bundling several fields under a single output name: output "stack_info" { value = { dns = aws_alb.web.dns_name, vpc_id = aws_vpc.main.id, subnet_ids = [for s in aws_subnet.public : s.id] } } - one output name, multiple pieces of data inside it. Separate names still need separate output blocks.
+Explain the "Inconsistent dependency lock file" error :: The .terraform.lock.hcl file records exactly which provider versions were selected the last time init ran - if that lock file exists (often because a project directory, or just that one file, got copied from somewhere else) but doesn't match what required_providers in the current config actually needs, plan refuses to guess and asks you to reconcile it. Running terraform init, exactly as the error says, recomputes the lock file against the current configuration and resolves it - this is a common result of copying a .tf project into a new folder without also bringing its .terraform directory or re-running init fresh there.
+Using an incomplete resource plus terraform plan to discover required attributes - is that a legitimate technique? :: Confirmed, and genuinely good self-awareness about its limits. plan/validate error messages do reliably surface missing required arguments, so it's a real, usable way to explore an unfamiliar resource type while actually writing code with the docs open. It's correctly not an interview technique, though - in a live interview you're expected to already know or quickly recall a resource's required arguments, not discover them through trial-and-error plan output, which is slow and reveals you don't know the schema cold.
+How do I see what's inside "(N unchanged attributes hidden)" in plan output? :: terraform plan deliberately compacts attributes that aren't changing to cut noise - that's a plan-output-only behavior, not a state limitation. To see everything, use terraform state show aws_route_table.public (every current attribute of that one resource, nothing hidden), or terraform show for the entire state in full, human-readable form, or terraform show -json for scriptable output.
+If a module from the internet (a registry or GitHub source) is brought in, how do I test whether it actually works? :: terraform init to actually download it, terraform validate for basic syntax/type correctness, then terraform plan - ideally against a disposable sandbox account or workspace, never production - to see exactly what it would create before trusting it with real infrastructure. Read its own variables.tf and outputs.tf (or its README) to understand its required inputs first. terraform test (from Part 2's doubts) is the idiomatic automated version of this same idea - writing assertions against a module's behavior instead of eyeballing a plan each time.
+How do I add more routes to an aws_route_table resource? :: Add another route { } block inside the same resource - aws_route_table accepts as many inline route blocks as needed, each with its own cidr_block and target (gateway_id, nat_gateway_id, etc). The alternative, more flexible for routes added independently later, is a separate aws_route resource per route, each referencing the same route_table_id - functionally equivalent, just addressed and managed as distinct resources instead of nested blocks.
+How do I use -target and -replace on resources inside a module? :: Same flags, just addressed through the module path - terraform apply -target='module.tf3a.aws_lb.web' or terraform apply -replace='module.tf3a.aws_alb.web'. The module-qualified address (module.<call_name>.<resource_type>.<local_name>) is exactly what plan output already shows for anything inside a module call, so copy it directly from there.
+Why didn't terraform fmt format files inside modules/web-stack? :: terraform fmt only formats .tf files in the CURRENT directory by default - it does not recurse into subdirectories, module directories included. Run terraform fmt -recursive from the root to format every .tf file in the whole tree, modules and all, in one pass.
+If I change something inside the child module's main.tf after tf3a and tf3b already exist - like adding a default to a variable, or adding a brand new resource named web2 - what happens? :: There is only ever one copy of the module's code, so the change applies uniformly to every existing call on the next plan/apply - never just one. Adding a default to an existing variable only matters for calls that don't already explicitly supply that variable - an explicit value in a module block always wins over a default. Adding a genuinely new resource (a new aws_security_group named web2, for example) means Terraform plans to CREATE that resource under every existing module call that doesn't already have it - so both module.tf3a.aws_security_group.web2 and module.tf3b.aws_security_group.web2 get created on the next apply, one real new resource per existing call, not just one.
+
+[STAGE conclusion]
+HEADING: One module, two stacks, zero copy-pasted resources
+[P]
+Part 1 removed duplicated VALUES. Part 2 removed duplicated STRUCTURE for a single resource (count/for_each). Part 3 removes duplicated structure at the level of an entire stack - tf3a and tf3b are two fully independent, fully working VPC-through-ALB deployments, and modules/web-stack/main.tf exists exactly once. Every fault this page actually covered - a missing required variable, a forgotten init, a duplicate module label, count-vs-for_each at the module-call level - gets caught by Terraform reading its own config, before AWS is ever asked anything, which is a direct, earned payoff of everything built across all three parts so far.
+[BULLETS]
+module, source, and encapsulation turned "two nearly-identical stacks" into one reusable shape called twice - module.tf3a.X and module.tf3b.X never collide, with zero internal naming discipline required, because each call gets its own implicit namespace for free.
+Reaching past a module's boundary (module.tf3a.aws_vpc.main.id) fails on purpose - only what a module's own outputs.tf explicitly exposes is visible outside it, and that boundary is what makes calling a module any number of times safe.
+moved blocks, introduced in Part 2 for count-to-for_each, turned out to generalize further still - they're also the correct tool for relocating already-live resources INTO a module without downtime, mapping a root-level address to its new module-qualified one.
+Module-call mistakes are structurally easier to catch than the live tf1/tf2 incidents were - missing variables and missing init are facts visible in config alone, while a DependencyViolation can only ever be discovered by actually asking AWS, which is why one class of fault shows up at plan and the other only at apply.
+[NOTE]
+Part 4 picks up the one real gap this page's two-call pattern doesn't close: tf3a and tf3b are identical in SHAPE but arbitrary in purpose - nothing marks either one as "the real one" versus "the throwaway one." Real teams don't call the same module twice for no reason; they call it once per ENVIRONMENT - dev, staging, prod - each with deliberately different inputs (smaller instance sizes and lower asg_min_size in dev, stricter allowed_ssh_cidr and higher capacity in prod) and, critically, different safeguards against mixing them up. Part 4 covers exactly that: workspaces versus separate state files versus separate directories as three different ways to keep environments apart, and why "I meant to apply to dev but it applied to prod" is a real, well-documented class of incident - not a hypothetical one.
