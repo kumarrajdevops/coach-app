@@ -1,0 +1,323 @@
+MODULE: terraform-4
+TITLE: Terraform — Part 4: Dev/Prod Environments
+COVERED: 2026-10-30
+
+[STAGE knowledge]
+HEADING: tf3a and tf3b were identical in shape, arbitrary in purpose
+[P]
+Part 3 closed the "same stack, written twice" gap with modules - but tf3a and tf3b have no real identity. Nothing marks either one as "the one that matters" versus "the one it's fine to break." Real infrastructure needs exactly this distinction: a dev environment where mistakes are cheap and a prod environment where they're not, built from the same module, but with real safeguards against ever applying the wrong input to the wrong one. "I meant to apply to dev but it hit prod" is a well-documented, real class of incident - not a hypothetical scaremongering example - and it happens specifically because Terraform, left to defaults, makes dev and prod look nearly identical from the command line.
+
+[STAGE pieces]
+HEADING: workspaces, separate state files, separate directories - three different isolation strategies
+[DIAGRAM nodes="modules/web-stack/ (one module)|dev workspace / dev.tfvars|prod workspace / prod.tfvars|terraform plan -var-file|same code, different state" highlight="dev workspace / dev.tfvars|prod workspace / prod.tfvars"]
+[DEFS]
+terraform workspace :: a named, isolated state namespace within ONE working directory - the same .tf files, but `terraform workspace select prod` points every subsequent plan/apply at a completely separate state file behind the scenes. `terraform.tfstate.d/<workspace>/terraform.tfstate` is where each one actually lives on local state.
+terraform.workspace :: a built-in reference available inside any .tf file, resolving to the currently selected workspace's name as a plain string - usable in resource names, tags, or to pick values out of a map, without needing a separate variable for it.
+-var-file :: an explicit flag supplying a whole file of variable values at once - `terraform plan -var-file=dev.tfvars` - the deliberate alternative to the auto-loaded terraform.tfvars from Part 2, used specifically when there's more than one environment and no single file should auto-load by default.
+Separate state file (per environment, same workspace) :: using `-state=dev.tfstate` / `-state=prod.tfstate`, or a different backend configuration per environment, instead of workspaces - a second, independent way to keep environments from ever sharing one state file.
+Separate directories (per environment) :: the most explicit isolation of all - envs/dev/ and envs/prod/ as entirely separate working directories, each with its own small main.tf that calls the same shared module with different variable values, each with its own independent state by construction, not by a flag you have to remember.
+
+[STAGE hands-on]
+HEADING: The same web-stack module, called once per environment, three different ways
+[P]
+All three approaches below call the exact same modules/web-stack from Part 3, unmodified. What differs is purely how dev and prod are kept apart. Build and compare all three on the same module to see the real trade-offs, not just read about them.
+[CODE lang=tree caption="layout for this page - one shared module, three isolation strategies living side by side"]
+.
+├── modules/
+│   └── web-stack/        (unchanged from Part 3 - main.tf, variables.tf, outputs.tf)
+├── approach-1-workspaces/
+│   └── main.tf            (no tfvars files - terraform.workspace + a local map supplies every value, see below)
+├── approach-2-state-files/
+│   ├── main.tf
+│   ├── variables.tf
+│   ├── dev.tfvars
+│   └── prod.tfvars
+└── approach-3-directories/
+    ├── envs/dev/main.tf
+    └── envs/prod/main.tf
+[CODE lang=hcl caption="approach-1-workspaces/main.tf - one config, terraform.workspace picks the values"]
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+}
+
+locals {
+  # terraform.workspace resolves to whatever `terraform workspace select` last set -
+  # this map is how ONE config produces different real values per environment
+  env_config = {
+    dev = {
+      instance_type = "t3.micro"
+      asg_min_size  = 1
+      asg_max_size  = 2
+    }
+    prod = {
+      instance_type = "t3.small"
+      asg_min_size  = 2
+      asg_max_size  = 6
+    }
+  }
+}
+
+module "web" {
+  source           = "../modules/web-stack"
+  project_name     = "tf4-${terraform.workspace}"      # "tf4-dev" or "tf4-prod", automatically
+  ami_id           = "ami-0abcd1234efgh5678"
+  instance_type    = local.env_config[terraform.workspace].instance_type
+  key_name         = "your-keypair-name"
+  allowed_ssh_cidr = "203.0.113.5/32"
+  vpc_cidr         = terraform.workspace == "prod" ? "10.9.0.0/16" : "10.8.0.0/16"
+  asg_min_size     = local.env_config[terraform.workspace].asg_min_size
+  asg_max_size     = local.env_config[terraform.workspace].asg_max_size
+  public_subnets = {
+    a = { cidr_block = terraform.workspace == "prod" ? "10.9.1.0/24" : "10.8.1.0/24", availability_zone = "us-east-1a" }
+    b = { cidr_block = terraform.workspace == "prod" ? "10.9.2.0/24" : "10.8.2.0/24", availability_zone = "us-east-1b" }
+  }
+}
+
+output "alb_dns_name" {
+  value = module.web.alb_dns_name
+}
+[NOTE]
+No dev.tfvars or prod.tfvars files exist for this approach, and that's deliberate, not an omission - the whole point of the workspaces strategy is that ONE config, with no extra flags or files, produces different values automatically based on whichever workspace is currently selected. Every value this environment needs - instance size, ASG capacity, CIDR - comes from local.env_config[terraform.workspace] or a ternary on terraform.workspace, baked directly into main.tf. If this approach needed tfvars files too, it would just be approach 2 with extra steps.
+[CODE lang=bash caption="CHECK 1 - create both workspaces, apply dev, confirm prod is still untouched"]
+cd approach-1-workspaces
+terraform init
+terraform workspace new dev
+terraform workspace new prod
+terraform workspace select dev
+terraform workspace show                 # confirm: "dev" - the single most important habit this page teaches
+terraform plan
+terraform apply
+curl http://$(terraform output -raw alb_dns_name)
+
+# now check prod WITHOUT switching to it - does it show anything planned?
+terraform workspace select prod
+terraform plan
+# Plan: 11 to add, 0 to change, 0 to destroy - prod has never been applied,
+# completely independent state from dev, even though it's the same main.tf
+[CODE lang=hcl caption="approach-2-state-files/variables.tf - every variable, properly typed - same discipline Part 2 taught, not skipped here"]
+variable "project_name" {
+  description = "Prefix for every resource this environment creates"
+  type        = string
+}
+variable "instance_type" {
+  description = "EC2 instance size for this environment's ASG"
+  type        = string
+}
+variable "vpc_cidr" {
+  description = "CIDR block for this environment's VPC"
+  type        = string
+}
+variable "asg_min_size" {
+  description = "Minimum (and starting desired) ASG capacity for this environment"
+  type        = number
+}
+variable "asg_max_size" {
+  description = "Maximum ASG capacity for this environment"
+  type        = number
+}
+variable "public_subnets" {
+  description = "Keyed by a stable name, not list position - same reasoning as Part 2"
+  type        = map(object({ cidr_block = string, availability_zone = string }))
+}
+[CODE lang=hcl caption="approach-2-state-files/main.tf - identical module call to approach 1, but WITHOUT terraform.workspace - isolation via explicit state file flags instead"]
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"          # pinned deliberately - with no constraint at all, init silently
+    }                              # grabs whatever the newest major version happens to be right now
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+}
+
+# This version takes project_name, instance sizing, and CIDRs as plain
+# variables instead of terraform.workspace, supplied entirely via -var-file
+# at the command line - see variables.tf for every input this file needs
+module "web" {
+  source           = "../modules/web-stack"
+  project_name     = var.project_name
+  ami_id           = "ami-0abcd1234efgh5678"
+  instance_type    = var.instance_type
+  key_name         = "your-keypair-name"
+  allowed_ssh_cidr = "203.0.113.5/32"
+  vpc_cidr         = var.vpc_cidr
+  asg_min_size     = var.asg_min_size
+  asg_max_size     = var.asg_max_size
+  public_subnets   = var.public_subnets
+}
+
+output "alb_dns_name" {
+  value = module.web.alb_dns_name
+}
+[CODE lang=hcl caption="approach-2-state-files/dev.tfvars - every variable main.tf declares, no defaults, so this file is required"]
+project_name  = "tf4dev"
+instance_type = "t3.micro"
+vpc_cidr      = "10.8.0.0/16"
+asg_min_size  = 1
+asg_max_size  = 2
+public_subnets = {
+  a = { cidr_block = "10.8.1.0/24", availability_zone = "us-east-1a" }
+  b = { cidr_block = "10.8.2.0/24", availability_zone = "us-east-1b" }
+}
+[CODE lang=hcl caption="approach-2-state-files/prod.tfvars - same shape, deliberately different values, same risk as any other file-based separation"]
+project_name  = "tf4prod"
+instance_type = "t3.small"
+vpc_cidr      = "10.9.0.0/16"
+asg_min_size  = 2
+asg_max_size  = 6
+public_subnets = {
+  a = { cidr_block = "10.9.1.0/24", availability_zone = "us-east-1a" }
+  b = { cidr_block = "10.9.2.0/24", availability_zone = "us-east-1b" }
+}
+[CODE lang=bash caption="CHECK 2 - two completely separate state files, enforced by an explicit flag every single time"]
+cd ../approach-2-state-files
+terraform init
+terraform plan  -state=dev.tfstate  -var-file=dev.tfvars
+terraform apply -state=dev.tfstate  -var-file=dev.tfvars
+# prod requires BOTH flags changed together, every time, by hand -
+# this is the real weakness this approach has, covered in troubleshoot below
+terraform plan  -state=prod.tfstate -var-file=prod.tfvars
+terraform apply -state=prod.tfstate -var-file=prod.tfvars
+[CODE lang=hcl caption="approach-3-directories/envs/dev/main.tf - its own directory, its own state by construction, nothing shared with prod but the module source"]
+module "web" {
+  source           = "../../modules/web-stack"
+  project_name     = "tf4dev"
+  ami_id           = "ami-0abcd1234efgh5678"
+  instance_type    = "t3.micro"
+  key_name         = "your-keypair-name"
+  allowed_ssh_cidr = "203.0.113.5/32"
+  vpc_cidr         = "10.8.0.0/16"
+  asg_min_size     = 1
+  asg_max_size     = 2
+  public_subnets = {
+    a = { cidr_block = "10.8.1.0/24", availability_zone = "us-east-1a" }
+    b = { cidr_block = "10.8.2.0/24", availability_zone = "us-east-1b" }
+  }
+}
+
+output "alb_dns_name" {
+  value = module.web.alb_dns_name
+}
+[CODE lang=hcl caption="approach-3-directories/envs/prod/main.tf - the most explicit isolation: its own directory, its own state by construction"]
+module "web" {
+  source           = "../../modules/web-stack"
+  project_name     = "tf4prod"
+  ami_id           = "ami-0abcd1234efgh5678"
+  instance_type    = "t3.small"
+  key_name         = "your-keypair-name"
+  allowed_ssh_cidr = "203.0.113.5/32"
+  vpc_cidr         = "10.9.0.0/16"
+  asg_min_size     = 2
+  asg_max_size     = 6
+  public_subnets = {
+    a = { cidr_block = "10.9.1.0/24", availability_zone = "us-east-1a" }
+    b = { cidr_block = "10.9.2.0/24", availability_zone = "us-east-1b" }
+  }
+}
+
+output "alb_dns_name" {
+  value = module.web.alb_dns_name
+}
+[CODE lang=bash caption="CHECK 3 - a typo'd command literally cannot reach the wrong environment here"]
+cd ../approach-3-directories/envs/dev
+terraform init
+terraform plan
+terraform apply
+# there is no flag to forget and no workspace to mis-select - being in the
+# wrong directory is the only way to hit the wrong environment, and that
+# mistake is visible in the shell prompt itself, not hidden in a flag
+
+[STAGE troubleshoot]
+HEADING: The exact "applied to the wrong environment" scenario, reproduced
+[P]
+Approach 2's two commands LOOK almost identical - the only difference between hitting dev and hitting prod is which two flag values got typed. Here's the realistic version of the mistake: switching between a few terminal tabs, you mean to re-apply dev after a small instance_type change, but paste a command still holding yesterday's prod state flag from your shell history.
+[CODE lang=bash caption="the typo that looks almost identical to the safe version"]
+# intended:
+terraform apply -state=dev.tfstate  -var-file=dev.tfvars
+
+# what actually got run - one flag behind, pulled from shell history
+terraform apply -state=prod.tfstate -var-file=dev.tfvars
+[P]
+Terraform does not warn you here. -state=prod.tfstate is a completely valid, existing state file; -var-file=dev.tfvars is a completely valid, existing variables file. Nothing about this command is malformed - it successfully applies dev's cheaper instance_type and lower asg_min_size directly onto prod's real, live state, silently downsizing production capacity.
+[NOTE]
+This is the precise, real failure mode that gives "I meant to apply to dev but it hit prod" its reputation - not a hypothetical, a documented and common incident shape at real companies, because two independently-correct-looking flags can combine into a completely wrong, completely silent result. Workspaces reduce this risk by making the CURRENT target a single, visible, stateful selection (terraform workspace show) instead of two flags that have to be remembered together and kept in sync by hand, every single command. Separate directories remove it almost entirely - the directory you are physically in IS the environment, with no flag combination able to override that.
+
+[STAGE key-insight]
+HEADING: Isolation strength is not the same question as workflow convenience
+[NOTE]
+Workspaces are the lightest-weight option - one directory, one terraform init, fast to switch between with a single command - but that lightness is exactly the risk surface in the troubleshoot above: the "current" workspace is global, easy to forget you're in, and nothing stops a typo'd apply from landing in whichever one happens to be selected at that moment. Separate state files via explicit flags make isolation deliberate and visible in the command itself, but require remembering to pass BOTH flags together, correctly, every time - one flag updated and the other forgotten is exactly how the troubleshoot scenario happens. Separate directories are the most foolproof - the working directory itself is the safeguard, no flag or selected-state to get out of sync - at the real cost of more files to keep in sync when the shared module's calling pattern needs to change (every environment's main.tf needs the same edit, separately, unless something like Terragrunt is layered on top to generate them). None of these is strictly "the correct" choice - production teams use all three, chosen for how severe a wrong-environment mistake would actually be. The higher the real cost of hitting prod by accident, the more this page's hierarchy favors directories over state-file flags over workspaces.
+
+[ROUND terraform4_r1]
+QUESTION: The troubleshoot section showed terraform apply -state=prod.tfstate -var-file=dev.tfvars succeeding completely silently - both flags were individually valid, so Terraform had no way to know this combination was a mistake. Explain precisely why workspaces structurally prevent this EXACT failure mode (a state target and a variable source quietly drifting out of sync), even though workspaces introduce their own different risk (forgetting which workspace is currently selected). Then: using the separate-directories approach as your reference, explain why "being in the wrong directory" is a fundamentally different KIND of mistake than "passing a wrong flag" - what has to go wrong for each one to actually happen, and which one is easier to catch before running a command versus after. Finally: if you were advising a team where a production mistake could mean real financial damage, which of the three approaches would you recommend as the default, and name one concrete thing from this page's material that justifies picking it over the other two specifically.
+DOUBTS: 1. HP@DESKTOP-0L13UPS MINGW64 .../approach-1-workspaces (main) $ terraform workspace list - default, dev, * prod - what is default here?
+2. in approach-1 i thought i was on dev and applied destroy. now i see it is actually prod. if prod has db,s3,etc important data it would have gone. how to resolve this issue.
+3. this default workspace is confusing in approach-1. can we make dev as default workspace. is it possible?
+4. also in approach-1, changing between workspaces is confusing and had to leave half baked work to stop in fear it might apply to prod as well.
+5. in approach-1 how to add new resource like s3 in dev only for testing but prod implementation not finalized yet.
+6. what happens between terraform version changes?
+7. so order for separate-env is use separate dir (approach-3) if not use workspaces (approach-1) but never separate tfvars (approach-2). is it right?
+ANSWER: Since terraform applies state prod.tfstate and where file is dev.tfvars so it will silently complete the things and it will destroy the prod resources if there are any - the reason is like the state file was able to manage it but it does not know where the variable files are coming from. Coming to workspaces - there is a separate section under a workspaces folder, inside that there are separate state files, one having dev and one having prod, so whenever there is a risk of drifting we can directly have that - whenever we select the workspace it will select those var files and tf files only. Coming to the third problem, wrong directory fundamentally - you have a lot of information on the shelf as well, like which path you are working on, so it would be easy to focus, and it is isolated from different environment directories itself, so the state file will be in separate directories, easy to plan and check drifts instead of comparing one file against all things. My thing is I'll use separate directories as default instead of separate var files or separate workspaces - within that I will have an isolated environment, I can watch what files are there and what files are dependent on which environment, and I already know all the files are relevant to that environment only, not shared between prod. Only thing is with other systems I might get confused and get errors I'm not able to solve.
+SAVEDAT: 2026-10-30T14:25:58.734Z
+REVIEWED: true
+VERDICT: partial
+ASSESSMENT: Real, correct instincts throughout, and worth noting directly: your opening line ("it will destroy the prod resources if there are any") predicted, almost exactly, the real incident described in doubt 2 below - that's not a coincidence, that's you genuinely understanding the risk before living through a version of it. Part 1 (why workspaces prevent the exact flag-drift failure) gets close - you correctly said workspace selection bundles state and tf files together as one unit - but doesn't land the precise mechanism: with -state/-var-file, there are TWO independent things to keep in sync by hand; with a workspace, there is only ONE thing selected at a time (terraform workspace select X), so there's nothing separate left to drift apart from. Part 2 (wrong directory vs wrong flag, and which is easier to catch before vs after) touches on directories being easier to "focus" in and isolated, but doesn't directly answer what was asked - what has to go wrong for each mistake to actually happen, and the before/after-catchability distinction. Part 3 (recommendation + concrete justification) is answered correctly and directly - separate directories, as the default - but without citing one specific concrete thing from this page's own material, which the question explicitly asked for.
+CLARIFICATION: Full answer for the record. Part 1 - the precise mechanism: -state and -var-file are two SEPARATE, INDEPENDENT flags you must keep in sync by hand on every single command - nothing stops you from pairing state=prod with vars=dev, because Terraform has no concept that these two flags are "supposed to" travel together. A workspace collapses that into ONE selection: terraform workspace select prod sets a single, stateful "current target," and every subsequent plan/apply - with no flags needed at all - reads from that one selection consistently. There is no second, independent value that could possibly drift out of sync with it, because there is nothing else to select. The real remaining risk, which you also correctly named, is forgetting which workspace is currently selected - a different, weaker risk (one fact to forget) than two flags silently drifting apart (two facts to keep paired correctly, forever). Part 2 - a wrong flag requires getting something WRONG while everything else looks right - the command runs in the correct directory, the correct main.tf, you just typed or pasted one incorrect value among several correct-looking ones; nothing about the moment of typing it looks unusual. A wrong directory requires being somewhere else entirely - and that fact is visible BEFORE you ever run a command, in your own shell prompt (exactly like the real MINGW64 prompt in your own terminal output, which literally names the current directory every single time). This is the actual distinction asked for: a wrong flag is only ever caught AFTER running the command, usually after seeing the plan's diff (if you read it carefully) or worse, after apply. A wrong directory is catchable BEFORE running anything, just by glancing at the prompt - the mistake is visible at the point you'd make it, not just at the point you discover its consequences. Part 3 - the concrete material that justifies recommending directories specifically: this page's own troubleshoot section demonstrated terraform apply -state=prod.tfstate -var-file=dev.tfvars succeeding completely silently, with Terraform having zero way to detect the combination was wrong - and the real incident in doubt 2 below is the workspace equivalent of that exact failure mode, now lived through for real. When a mistake can be both completely silent AND cause real financial damage, the right default is whichever approach makes the mistake impossible to make quietly - which is directories, specifically because the safeguard (being in the right place) is checked by the human before the command runs, not inferred by Terraform after.
+DOUBT_ANSWERS: What is the "default" workspace shown in terraform workspace list? :: It's the workspace that exists automatically in every Terraform configuration, even before you ever run terraform workspace new - not something you created. Checked your real directory just now: no state file exists for it at all (no plain terraform.tfstate in the working directory, which is where default's state specifically lives - dev and prod each get their own file under terraform.tfstate.d/<name>/, but default uses the root-level file directly). So in your case it's genuinely empty and unused - nothing has ever been applied while on it, which is exactly what you'd want: it's the safe fallback most teams deliberately never put real resources into.
+I thought I was on dev and applied destroy, but it was actually prod - real resources are gone. How do I resolve this? :: Confirmed directly against AWS just now: the prod ASG, ALB, and VPC are genuinely destroyed - this really happened, not a hypothetical. Since this is your own practice/learning stack and not real production data, nothing irreplaceable was lost - your prod workspace's terraform.tfstate.backup file still has a full record of exactly what existed right before the destroy, if you ever want to reference it. Going forward, run terraform apply on the prod workspace again whenever you're ready and it will rebuild cleanly from your existing main.tf and prod.tfvars - say the word and I can run it. The real lesson here is the one this page's troubleshoot section exists to teach: this exact kind of mistake is why workspaces alone aren't considered sufficient isolation for anything where a wrong-environment mistake would be unacceptable - which is precisely what just happened.
+Can dev be made the default workspace instead of "default"? :: Not exactly - "default" is a fixed, built-in name Terraform always creates and will not let you rename or delete while it's the current workspace. What you can do instead: simply never use "default" at all (as you already aren't), and always explicitly terraform workspace select dev as your normal starting state - there's no way to make Terraform auto-select dev on startup, but you can make checking the current workspace a habit (terraform workspace show) before every plan/apply, which is the real, structural reason this page's key-insight calls that specific habit out.
+Switching between workspaces is confusing, and I had to leave half-finished work out of fear it would apply to prod :: That fear is well-founded, not overcautious - it's exactly the real risk this page's material describes, and your own real incident (doubt 2) proves it wasn't hypothetical. A concrete habit that helps directly: run terraform workspace show immediately before every single plan or apply, no exceptions, treating it the same as checking your pwd before an rm -rf. Beyond that, this is one of the strongest real arguments for preferring separate directories (approach 3) for anything where a mistake matters - the anxiety you're describing is the direct, lived cost of workspaces' convenience, and it doesn't exist in approach 3 at all, because there's nothing to switch.
+How do I add a new resource (like S3) to dev only, for testing, while prod's implementation isn't finalized yet? :: Add the resource inside the SAME shared module (modules/web-stack) only if it genuinely belongs in every environment eventually - remember from Part 3's doubts that a module has exactly one copy of its code, so anything added there affects every existing caller (dev AND prod) on the next apply, not just dev. For something you specifically want in dev only, for now, two real options: add it OUTSIDE the module, directly in approach-1-workspaces/main.tf, wrapped in a count or for_each conditioned on terraform.workspace == "dev" (so it only gets created when dev is selected) - or, cleaner, don't add it to shared code at all yet; create it as a completely separate, standalone resource block in a new file in the dev-only context until prod's version is actually decided, then move it into the shared module properly once it is.
+What happens across Terraform version changes (upgrades)? :: Two separate things change independently: the Terraform CLI/core version (what you install via winget, currently 1.17.x) follows its own release notes for new language features, deprecations (like -state's deprecation warning you hit), and bug fixes - your required_version constraint in the terraform {} block controls which CLI versions are even allowed to run your config. The PROVIDER version (hashicorp/aws, currently pinned to ~> 5.0 after today's fix) is entirely separate - it tracks AWS's own API surface and gets its own changelog, its own breaking changes between major versions, and its own lock file entry. Upgrading either one deliberately (terraform init -upgrade for providers; reinstalling Terraform itself for core) is safe practice; having NO version constraint at all - what approach-2 actually had until today - means an ordinary init can silently jump to a newer major version of either one without you ever deciding to.
+Is the right hierarchy "use separate directories, otherwise workspaces, but never separate tfvars (approach 2)"? :: Close, but "never" approach 2 is stronger than this page's own material actually supports - the real ordering, grounded in everything covered: directories are safest by construction (no flag or selection to forget), workspaces are next (one single selection, but still something to forget), and separate state-file flags are the weakest precisely because two independent things must be kept in sync by hand every time - and today you also learned that approach was actually using a deprecated -state flag, which argues even harder against it. "Never" is fine as your own practical default, but the honest, page-accurate framing is: all three are real, used-in-production techniques, chosen by how severe a wrong-environment mistake would actually be - approach 2 is the correct choice is rare, specifically for codebases that need fine-grained control over exactly where each environment's backend configuration lives and can tolerate (or heavily automate around) its sync risk.
+What does terraform init -upgrade actually do, and when do I need it? :: Forces Terraform to re-resolve every provider version against your CURRENT configuration's constraints, instead of reusing whatever's already pinned in .terraform.lock.hcl. You needed it specifically because your lock file had 6.71.0 locked in from before any version constraint existed in your file - once ~> 5.0 was added, plain terraform init refused to silently swap the locked version out, exactly as the error said. Confirmed live: running it installed 5.100.0 (the newest version actually satisfying ~> 5.0) and updated the lock file to record that constraint going forward.
+Why is -state deprecated, and what should approach 2 use instead? :: Confirmed directly from terraform plan -help: -state=statefile is explicitly labeled "A legacy option used for the local backend only." It still works, which is why your plan completed, but it's flagged for eventual removal. The modern replacement is partial backend configuration via -backend-config, supplied to terraform init (not plan/apply) - an empty backend "local" {} block in config, then terraform init -backend-config="path=dev.tfstate" -reconfigure to point it at a specific file. The honest trade-off, worth knowing before switching: this is MORE friction than the deprecated flag, not less - switching environments now requires a full re-init, not just different flags - which is itself a real point in favor of approach 3 over approach 2 generally.
+What actually happens in approach 2 if neither -state nor -var-file is given? :: Two different outcomes. Missing -var-file: every variable in variables.tf is required with no default, so Terraform interactively prompts you at the terminal for each one, one at a time (var.project_name, Enter a value: ...) - blocking until answered, or erroring immediately only in a non-interactive context like CI. Missing -state is the more dangerous half: Terraform silently falls back to a generic terraform.tfstate file in the current directory - neither dev's nor prod's - potentially creating a THIRD, completely untracked set of resources with no connection to either environment's real state. Confirmed your own directory doesn't have one of these stray files yet, since you've always passed -state explicitly so far - but the risk is real the moment that flag is ever forgotten.
+
+[STAGE fault-injection]
+HEADING: Four real incidents, all from today, none staged
+[P]
+Every row below actually happened, live, while working through this exact page - not hypothetical examples written in advance. One of them is the instance_refresh issue deliberately held back from Part 3 until here, since this is literally the page where it occurred.
+[TABLE]
+Symptom | Real cause | Fix
+Changed the launch template's instance_type, added an instance_refresh block, applied - the running instance never replaced | version = "$Latest" in the ASG's launch_template block is a LITERAL STRING - it evaluates identically every single apply, so Terraform's plan never sees it change, and instance_refresh's default trigger specifically watches for that exact attribute changing. No detected change, no refresh, ever - confirmed by describe-instance-refreshes returning completely empty before the fix | version = aws_launch_template.web.latest_version instead - a genuinely different computed value each time a new template version exists, which plan correctly detects and instance_refresh correctly reacts to
+terraform plan -state=dev.tfstate -var-file=dev.tfvars succeeds, but prints Warning: Deprecated flag: -state | -state=statefile is explicitly labeled by Terraform's own -help text as "a legacy option used for the local backend only" - it still works, but is flagged for eventual removal | Partial backend configuration via -backend-config at init time instead - more upfront friction (a full re-init per environment switch), which is itself a real argument for approach 3 over approach 2
+terraform init fails with Error: Inconsistent dependency lock file - locked provider version does not match configured version constraint, right after adding version = "~> 5.0" to a file that previously had no constraint at all | The .terraform.lock.hcl already had a newer major version (6.71.0) pinned from an earlier init that ran with zero constraint anywhere in the config - a later, stricter constraint doesn't retroactively change what's already locked | terraform init -upgrade - forces Terraform to re-resolve against the current constraint instead of reusing the stale lock entry
+Ran a destroy believing the dev workspace was selected - the real prod VPC, ASG, and ALB were destroyed | terraform workspace select sets one single, global, stateful selection with no visual indicator in the command itself - unlike approach 2's two independently-wrong flags, this was one single fact (which workspace is current) simply forgotten, and nothing in a bare terraform destroy prints which workspace it's about to act on | terraform workspace show before every single plan/apply/destroy, no exceptions - and for anything where this mistake would be unacceptable, prefer approach 3 (separate directories) specifically because the safeguard is visible in the shell prompt before the command runs, not dependent on remembering to check
+[NOTE]
+Three different root causes produced these four incidents - a literal string that can never show a diff, a legacy CLI flag nobody flagged as risky until -help said so directly, a lock file reflecting history the current config no longer agrees with, and a single forgotten selection with no command-level safeguard - but all four share the same shape as every incident since Part 1: Terraform correctly did exactly what its own configuration and CLI flags told it to do. Nothing here was a bug. Every one of these was a human working from an assumption (new instances auto-refresh; a familiar flag is still current; a constraint change rewrites history; "I'm pretty sure I'm on dev") that turned out to be wrong, and Terraform had no way to know that.
+
+[ROUND terraform4_r2]
+QUESTION: Of the four incidents above, the real prod-destroy is the only one that caused actual, unrecoverable (for real production data) damage - the other three were caught by an error message or a quiet non-event before anything was lost. Explain precisely why the first three incidents all had some form of guardrail (a trigger that silently didn't fire, a deprecation warning, a lock-file error) while the fourth had none at all - what is structurally different about "an attribute that should have changed but didn't" or "a flag that still works but is flagged" compared to "a destroy command running against whichever workspace happens to be selected." Then: if you had to add exactly ONE guardrail to approach-1's workflow - not switching to approach 3, just one real safeguard bolted onto workspaces as they are - what would it be, and why would it have specifically prevented the real incident that happened today. Finally, using everything from this page: is "always run terraform workspace show before any destructive command" a sufficient fix on its own, or does it have the same fundamental weakness as remembering to pass two matching flags in approach 2 - explain your reasoning either way.
+DOUBTS:
+ANSWER: Okay I don't know how many questions you have that you are asking currently. The first three had some form of guardrail because they are tied up with some form of setup like state file and variable file - whenever we are trying to apply it, terraform plan was doing type check and also config check, and then it was prompting some errors when they are not fit, like deprecation warning or file lock errors, everything. The fourth one was a deliberate mistake from my side - I did not check which workspace I was on and I simply implemented the command terraform destroy, thinking it was in dev environment instead of prod. So the thing is I would have checked - when we are using workspaces as environment operations we should always check terraform workspace show and we should select the required workspace before applying or planning as well, so it's a basic thing to help us, eventually it will not happen in future like that. One more thing I would like to add is since it was a database I would have had a lifecycle policy inside the main.tf file like ignore from deletion - something like that I should have given to it. Always run terraform workspace show before any destructive command - no, we need to check what are the things that are happening because plan and apply also sometimes will delete things, will replace things and everything, so we need to be careful with those commands as well, not only for the destruction command - we should check and select the required workspace for every command like plan and apply.
+SAVEDAT: 2026-10-30T15:25:20.842Z
+REVIEWED: true
+VERDICT: partial
+ASSESSMENT: Part 1 gestures at the right area (config/type checks, deprecation warnings, lock-file checks) but doesn't land the precise structural distinction the question asked for - WHY these three are checkable and the fourth isn't. Part 2 is the standout of this answer: lifecycle { prevent_destroy = true } is a real, correctly-named Terraform feature that was NEVER taught anywhere on this page - bringing in genuine, correct, outside knowledge like that deserves real credit, even though it arrived as an afterthought ("one more thing I'd like to add") rather than being presented as the direct, intended answer to "what ONE guardrail." It's actually the stronger answer than the workspace-show habit you led with, precisely because it's enforced by Terraform itself rather than human memory - which is exactly the distinction Part 3 was asking you to reason about. Part 3 pivoted to a related but different point ("check before every command type, not just destroy") rather than directly answering whether workspace-show-checking shares the SAME underlying weakness as approach 2's two-flags problem - it does, and connecting that dot explicitly would have tied the whole answer together.
+CLARIFICATION: Full answer for the record. Part 1 - the precise structural distinction: the first three incidents are all things TERRAFORM ITSELF can check against something objective and already written down - a provider's schema (does this attribute's computed value actually differ), a CLI's own deprecation list (is this flag marked legacy), a lock file's recorded version (does it satisfy this constraint). All three are static, checkable facts that exist independently of what any human currently intends. A workspace-selection mistake has no such anchor - "which environment do I mean right now" is pure human intent, and intent is not written down anywhere Terraform's tooling can compare against. There is no config file, schema, or lock entry that says "the user meant dev" - so there is structurally nothing for Terraform to check a destroy command against, which is exactly why this is the one incident with zero built-in guardrail. Part 2 - prevent_destroy, exactly as you proposed, is the strongest single real-world answer: resource "aws_vpc" "main" { lifecycle { prevent_destroy = true } } - added to anything in modules/web-stack you'd never want silently destroyed, in prod specifically (it can be applied per-resource, so dev's throwaway resources can stay freely destroyable while prod's can't). With this in place, today's actual destroy command would have FAILED outright with an explicit Terraform error, before touching a single real resource - this is a genuine technical guardrail, not a habit, which is the whole point of "one guardrail bolted onto workspaces as they are." Part 3 - yes, workspace show-before-every-command shares the exact same fundamental weakness as approach 2's two-flags problem: both are pure discipline, enforced by nothing but human memory, and both fail completely the one time you forget - which is precisely what happened today. The real, honest answer the page's own material supports: a habit can reduce how OFTEN this mistake happens, but only something Terraform itself enforces - prevent_destroy, or approach 3's structural "wrong directory is visible before you type anything" - can make the mistake actually impossible rather than just less likely. Today's real incident is proof the habit alone isn't sufficient; it was exactly the habit you'd already been taught and still wasn't followed in the moment.
+
+[STAGE conclusion]
+HEADING: Three isolation strategies, one real lesson about where safety actually lives
+[P]
+This page set out to answer "how do you keep dev and prod apart," and ended up teaching something sharper: the difference between a mistake Terraform can catch and a mistake only a human can prevent. Every fault on this page but one - the missing instance_refresh trigger, the deprecated flag, the lock-file conflict - was something Terraform's own tooling flagged, loudly, before real damage happened. The one exception destroyed real infrastructure, in your own account, during this very page's hands-on practice - not a hypothetical, not a staged example.
+[BULLETS]
+Workspaces, separate state-file flags, and separate directories all genuinely work - the real difference between them isn't correctness, it's how much of the safety depends on a human remembering something correctly, every single time, forever.
+Approach 2's two independent flags and approach 1's single forgotten workspace selection are the same underlying risk wearing two different shapes - something that must be kept correct by memory alone, with nothing in the tool itself checking it.
+Approach 3 isn't safer because directories are magic - it's safer because the safeguard (being in the right place) is visible to a human BEFORE a command runs, not something Terraform infers after.
+lifecycle { prevent_destroy = true } is the one guardrail from today that isn't a habit at all - it's enforced by Terraform itself, the same category of protection as a ForceNew check or a required variable, not the same category as "remember to check."
+[NOTE]
+Part 5 is the last part of this Terraform track, and it closes the loop this page opened: what actually happens to state over the long run - remote backends (so state isn't a single local file at all, the real production answer to everything approach 2 struggled with), terraform import (bringing already-existing, unmanaged infrastructure under Terraform's control - relevant the moment anyone ever needs to adopt resources that weren't created by Terraform in the first place), and the genuinely complex, real-world problems that only show up at scale: state locking across a team, drift detection, and the operational discipline every incident on this page has actually been pointing toward the whole time.

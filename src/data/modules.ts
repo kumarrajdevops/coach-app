@@ -7,6 +7,7 @@ import vpcRaw from "./content/vpc.txt?raw"
 import terraformPart1Raw from "./content/terraform-part1.txt?raw"
 import terraformPart2Raw from "./content/terraform-part2.txt?raw"
 import terraformPart3Raw from "./content/terraform-part3.txt?raw"
+import terraformPart4Raw from "./content/terraform-part4.txt?raw"
 
 export const seedModules: Module[] = [
   parseModuleContent(ec2Raw),
@@ -16,4 +17,5 @@ export const seedModules: Module[] = [
   parseModuleContent(terraformPart1Raw),
   parseModuleContent(terraformPart2Raw),
   parseModuleContent(terraformPart3Raw),
+  parseModuleContent(terraformPart4Raw),
 ]

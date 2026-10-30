@@ -118,7 +118,7 @@ resource "aws_autoscaling_group" "web" {
 
   launch_template {
     id      = aws_launch_template.web.id
-    version = "$Latest"
+    version = "$Latest"      # resolves for NEW launches only - never touches instances already running (see Round 1's doubts below)
   }
 
   tag {
@@ -452,7 +452,7 @@ resource "aws_autoscaling_group" "tuf" {
 
   launch_template {
     id      = aws_launch_template.tuf.id
-    version = "$Latest"
+    version = "$Latest"      # same caveat as tf1's ASG above - new launches only, never retroactive
   }
   tag {
     key                 = "Name"
